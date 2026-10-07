@@ -953,10 +953,11 @@ exports.getAllSales = async (req, res) => {
 
     if (search && search.trim()) {
       const cleanSearch = search.trim();
+      const escaped = cleanSearch.replace(/[-[\]{}()*+?.,\\^$|#]/g, "\\$&");
 
       // Find matching products by name
       const matchingProducts = await Product.find({
-        name: { $regex: cleanSearch, $options: "i" },
+        name: { $regex: escaped, $options: "i" },
       })
         .select("_id")
         .lean();
@@ -964,15 +965,15 @@ exports.getAllSales = async (req, res) => {
 
       // Find matching cashiers by name
       const matchingUsers = await User.find({
-        name: { $regex: cleanSearch, $options: "i" },
+        name: { $regex: escaped, $options: "i" },
       })
         .select("_id")
         .lean();
       const userIds = matchingUsers.map((u) => u._id);
 
       query.$or = [
-        { barcode: { $regex: cleanSearch, $options: "i" } },
-        { "items.barcode": { $regex: cleanSearch, $options: "i" } },
+        { barcode: { $regex: escaped, $options: "i" } },
+        { "items.barcode": { $regex: escaped, $options: "i" } },
         { "items.product": { $in: productIds } },
         { cashier: { $in: userIds } },
       ];

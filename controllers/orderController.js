@@ -458,13 +458,24 @@ exports.deleteOrder = async (req, res) => {
 
 exports.getOrders = async (req, res) => {
   try {
-    const { status, date, orderNumber, page, limit } = req.query;
+    const { status, date, state, isPaid, search, orderNumber, page, limit } =
+      req.query;
 
     const query = {};
 
     // status filter
-    if (status) {
+    if (status && status !== "") {
       query.status = status;
+    }
+
+    // state (wilaya) filter
+    if (state && state !== "") {
+      query.state = state;
+    }
+
+    // isPaid filter
+    if (isPaid !== undefined && isPaid !== "") {
+      query.isPaid = isPaid === "true" || isPaid === true;
     }
 
     // orderNumber filter
@@ -486,61 +497,75 @@ exports.getOrders = async (req, res) => {
       }
     }
 
+    // search filter
+    if (search && search.trim()) {
+      const cleanSearch = search.trim();
+      const escaped = cleanSearch.replace(/[-[\]{}()*+?.,\\^$|#]/g, "\\$&");
+      const numSearch = parseInt(cleanSearch.replace(/^#/, ""), 10);
+
+      // Find matching products by name
+      const matchingProducts = await Product.find({
+        name: { $regex: escaped, $options: "i" },
+      })
+        .select("_id")
+        .lean();
+      const productIds = matchingProducts.map((p) => p._id);
+
+      const orConditions = [
+        { fullName: { $regex: escaped, $options: "i" } },
+        { phone: { $regex: escaped, $options: "i" } },
+        { state: { $regex: escaped, $options: "i" } },
+        { source: { $regex: escaped, $options: "i" } },
+        { "items.barcode": { $regex: escaped, $options: "i" } },
+        { "items.product": { $in: productIds } },
+      ];
+
+      if (!isNaN(numSearch)) {
+        orConditions.push({ orderNumber: numSearch });
+      }
+
+      query.$or = orConditions;
+    }
+
     // Build base query
     let ordersQuery = Order.find(query)
       .sort({ createdAt: -1 })
       .populate("createdBy", "name")
       .populate(
         "items.product",
-        req.user.role === "worker" ? "name" : "name originalPrice",
+        req.user && req.user.role === "worker"
+          ? "name"
+          : "name originalPrice",
       )
       .lean();
 
     let pagination = null;
-    let total = null;
+    let total = await Order.countDocuments(query);
 
     // ───────────────────────────────────────────────
     // PAGINATION only when BOTH page AND limit exist
     // ───────────────────────────────────────────────
     if (page && limit) {
-      const pageNum = parseInt(page, 10);
-      const limitNum = parseInt(limit, 10);
-
-      if (isNaN(pageNum) || pageNum < 1 || isNaN(limitNum) || limitNum < 1) {
-        return res.status(400).json({
-          success: false,
-          message: "page و limit يجب أن يكونا أرقام موجبة صحيحة",
-        });
-      }
-
-      // Optional safety (prevent someone requesting 100000 items)
-      if (limitNum > 200) {
-        return res.status(400).json({
-          success: false,
-          message: "الحد الأقصى المسموح به لـ limit هو 200",
-        });
-      }
+      const pageNum = parseInt(page, 10) || 1;
+      const limitNum = parseInt(limit, 10) || 20;
 
       const skip = (pageNum - 1) * limitNum;
       ordersQuery = ordersQuery.skip(skip).limit(limitNum);
-
-      total = await Order.countDocuments(query);
 
       pagination = {
         total,
         page: pageNum,
         limit: limitNum,
-        pages: Math.ceil(total / limitNum),
+        pages: Math.ceil(total / limitNum) || 1,
         hasNext: skip + limitNum < total,
         hasPrev: pageNum > 1,
       };
     } else {
-      // No page & limit → return ALL matching orders
-      total = await Order.countDocuments(query);
-
       pagination = {
         total,
         all: true,
+        pages: 1,
+        page: 1,
         message: "جميع الطلبيات (بدون تقسيم صفحات)",
       };
     }
@@ -551,6 +576,9 @@ exports.getOrders = async (req, res) => {
       success: true,
       data: orders,
       pagination,
+      total,
+      pages: pagination ? pagination.pages : 1,
+      currentPage: pagination ? pagination.page : 1,
     });
   } catch (err) {
     console.error("Error fetching orders:", err);
