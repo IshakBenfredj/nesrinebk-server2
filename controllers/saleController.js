@@ -947,10 +947,37 @@ exports.exchangeProducts = async (req, res) => {
 
 exports.getAllSales = async (req, res) => {
   try {
-    const { date, page, limit, range } = req.query;
+    const { date, page, limit, range, search } = req.query;
 
     let query = {};
-    if (date) {
+
+    if (search && search.trim()) {
+      const cleanSearch = search.trim();
+
+      // Find matching products by name
+      const matchingProducts = await Product.find({
+        name: { $regex: cleanSearch, $options: "i" },
+      })
+        .select("_id")
+        .lean();
+      const productIds = matchingProducts.map((p) => p._id);
+
+      // Find matching cashiers by name
+      const matchingUsers = await User.find({
+        name: { $regex: cleanSearch, $options: "i" },
+      })
+        .select("_id")
+        .lean();
+      const userIds = matchingUsers.map((u) => u._id);
+
+      query.$or = [
+        { barcode: { $regex: cleanSearch, $options: "i" } },
+        { "items.barcode": { $regex: cleanSearch, $options: "i" } },
+        { "items.product": { $in: productIds } },
+        { cashier: { $in: userIds } },
+      ];
+      // Search works across all records regardless of selected day!
+    } else if (date) {
       if (range === "month") {
         const d = new Date(date);
         const start = new Date(d.getFullYear(), d.getMonth(), 1, 0, 0, 0, 0);

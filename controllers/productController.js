@@ -145,12 +145,14 @@ exports.getProducts = async (req, res) => {
     if (color) query["colors.color"] = color;
 
     if (barcode && barcode.trim()) {
-      query["colors.sizes.barcode"] = barcode.trim();
+      const cleanBarcode = barcode.trim();
+      query["colors.sizes.barcode"] = { $regex: cleanBarcode, $options: "i" };
     } else if (search && search.trim()) {
       const trimmed = search.trim();
       query.$or = [
         { name: { $regex: trimmed, $options: "i" } },
-        { "colors.sizes.barcode": trimmed },
+        { "colors.sizes.barcode": { $regex: trimmed, $options: "i" } },
+        { fabric: { $regex: trimmed, $options: "i" } },
       ];
     }
 
