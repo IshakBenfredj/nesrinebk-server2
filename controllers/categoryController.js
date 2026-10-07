@@ -39,16 +39,82 @@ exports.createCategory = async (req, res) => {
 // @access  Public
 exports.getCategories = async (req, res) => {
   try {
-    const categories = await Category.find();
+    const categories = await Category.find().sort({ createdAt: -1 });
+
+    // Get product counts for each category
+    const counts = await Product.aggregate([
+      { $unwind: "$category" },
+      { $group: { _id: "$category", count: { $sum: 1 } } },
+    ]);
+    const countsMap = new Map();
+    counts.forEach((c) => countsMap.set(String(c._id), c.count));
+
+    const enrichedCategories = categories.map((cat) => ({
+      ...cat.toObject(),
+      productCount: countsMap.get(String(cat._id)) || 0,
+    }));
 
     res.json({
       success: true,
-      data: categories,
+      data: enrichedCategories,
     });
   } catch (error) {
     res.status(500).json({
       success: false,
       message: "حدث خطأ أثناء جلب التصنيفات",
+    });
+  }
+};
+
+// @route   PUT /api/categories/:id
+// @desc    Update a category
+// @access  Private/Admin
+exports.updateCategory = async (req, res) => {
+  try {
+    const { name } = req.body;
+    if (!name || !name.trim()) {
+      return res.status(400).json({
+        success: false,
+        message: "اسم التصنيف مطلوب",
+        data: null,
+      });
+    }
+
+    const trimmedName = name.trim();
+    const existing = await Category.findOne({
+      name: trimmedName,
+      _id: { $ne: req.params.id },
+    });
+    if (existing) {
+      return res.status(400).json({
+        success: false,
+        message: "يوجد تصنيف آخر بهذا الاسم بالفعل",
+        data: null,
+      });
+    }
+
+    const category = await Category.findById(req.params.id);
+    if (!category) {
+      return res.status(404).json({
+        success: false,
+        message: "التصنيف غير موجود",
+        data: null,
+      });
+    }
+
+    category.name = trimmedName;
+    const updated = await category.save();
+
+    res.json({
+      success: true,
+      message: "تم تعديل التصنيف بنجاح",
+      data: updated,
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: "حدث خطأ أثناء تعديل التصنيف",
+      data: null,
     });
   }
 };
