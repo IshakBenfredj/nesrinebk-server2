@@ -1,4 +1,6 @@
+const mongoose = require("mongoose");
 const Product = require("../models/Product");
+const Category = require("../models/Category");
 const Order = require("../models/Order");
 const StockHistory = require("../models/StockHistory");
 const ProductHistory = require("../models/ProductHistory");
@@ -116,14 +118,42 @@ exports.createProduct = async (req, res) => {
 
 exports.getProducts = async (req, res) => {
   try {
-    const { category, color, search, minPrice, maxPrice } = req.query;
+    const {
+      category,
+      color,
+      search,
+      barcode,
+      minPrice,
+      maxPrice,
+      sortBy,
+      page,
+      limit,
+    } = req.query;
     const query = {};
 
     if (category) {
-      query.category = { $in: [category] };
+      if (mongoose.Types.ObjectId.isValid(category)) {
+        query.category = { $in: [category] };
+      } else {
+        const catDoc = await Category.findOne({ name: category });
+        if (catDoc) {
+          query.category = { $in: [catDoc._id] };
+        }
+      }
     }
+
     if (color) query["colors.color"] = color;
-    if (search) query.$text = { $search: search };
+
+    if (barcode && barcode.trim()) {
+      query["colors.sizes.barcode"] = barcode.trim();
+    } else if (search && search.trim()) {
+      const trimmed = search.trim();
+      query.$or = [
+        { name: { $regex: trimmed, $options: "i" } },
+        { "colors.sizes.barcode": trimmed },
+      ];
+    }
+
     if (minPrice || maxPrice) {
       query.price = {};
       if (minPrice) query.price.$gte = parseFloat(minPrice);
@@ -132,15 +162,46 @@ exports.getProducts = async (req, res) => {
 
     const isWorker = req.user && req.user.role === "worker";
 
-    const products = await Product.find(query)
+    // Sorting
+    let sort = { createdAt: -1 };
+    if (sortBy === "nameAsc") sort = { name: 1 };
+    else if (sortBy === "nameDesc") sort = { name: -1 };
+    else if (sortBy === "priceAsc") sort = { price: 1 };
+    else if (sortBy === "priceDesc") sort = { price: -1 };
+    else if (sortBy === "newest") sort = { createdAt: -1 };
+    else if (sortBy === "oldest") sort = { createdAt: 1 };
+
+    let productsQuery = Product.find(query)
       .populate("category", "name")
       .select(isWorker ? "-originalPrice" : "")
-      .sort({ createdAt: -1 })
+      .sort(sort)
       .lean();
+
+    const total = await Product.countDocuments(query);
+    let pagination = null;
+
+    if (page && limit) {
+      const pageNum = parseInt(page, 10) || 1;
+      const limitNum = parseInt(limit, 10) || 20;
+      const skip = (pageNum - 1) * limitNum;
+      productsQuery = productsQuery.skip(skip).limit(limitNum);
+      pagination = {
+        total,
+        page: pageNum,
+        limit: limitNum,
+        pages: Math.ceil(total / limitNum) || 1,
+      };
+    }
+
+    const products = await productsQuery;
 
     res.json({
       success: true,
       data: products,
+      total,
+      ...(pagination
+        ? { pages: pagination.pages, currentPage: pagination.page }
+        : { pages: 1, currentPage: 1 }),
     });
   } catch (error) {
     console.error("Error fetching products:", error);

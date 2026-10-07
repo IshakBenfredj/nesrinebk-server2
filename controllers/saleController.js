@@ -947,17 +947,39 @@ exports.exchangeProducts = async (req, res) => {
 
 exports.getAllSales = async (req, res) => {
   try {
-    const { date, page, limit } = req.query;
+    const { date, page, limit, range } = req.query;
 
     let query = {};
     if (date) {
-      const startDate = new Date(date);
-      startDate.setHours(0, 0, 0, 0);
+      if (range === "month") {
+        const d = new Date(date);
+        const start = new Date(d.getFullYear(), d.getMonth(), 1, 0, 0, 0, 0);
+        const end = new Date(
+          d.getFullYear(),
+          d.getMonth() + 1,
+          0,
+          23,
+          59,
+          59,
+          999,
+        );
+        query.createdAt = { $gte: start, $lte: end };
+      } else if (range === "year") {
+        const d = new Date(date);
+        const start = new Date(d.getFullYear(), 0, 1, 0, 0, 0, 0);
+        const end = new Date(d.getFullYear(), 11, 31, 23, 59, 59, 999);
+        query.createdAt = { $gte: start, $lte: end };
+      } else if (range === "all") {
+        // no date constraint
+      } else {
+        const startDate = new Date(date);
+        startDate.setHours(0, 0, 0, 0);
 
-      const endDate = new Date(date);
-      endDate.setHours(23, 59, 59, 999);
+        const endDate = new Date(date);
+        endDate.setHours(23, 59, 59, 999);
 
-      query.createdAt = { $gte: startDate, $lte: endDate };
+        query.createdAt = { $gte: startDate, $lte: endDate };
+      }
     }
 
     let salesQuery = Sale.find(query)
