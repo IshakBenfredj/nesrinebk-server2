@@ -68,7 +68,7 @@ exports.createOrder = async (req, res) => {
       });
     }
 
-    if (discountAmount > originalTotal) {
+    if (discountAmount > total) {
       return res.status(400).json({
         success: false,
         message: "مبلغ التخفيض لا يمكن أن يكون أكبر من الإجمالي الأصلي",
@@ -297,9 +297,8 @@ exports.updateOrder = async (req, res) => {
       typeof profit !== "number" ||
       originalTotal < 0 ||
       total < 0 ||
-      profit < 0 ||
       discountAmount < 0 ||
-      discountAmount > originalTotal
+      discountAmount > total
     ) {
       return res
         .status(400)

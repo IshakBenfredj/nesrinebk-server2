@@ -53,7 +53,7 @@ exports.createSale = async (req, res) => {
     console.log("total:", total, typeof total);
     console.log("profit:", profit, typeof profit);
     console.log("discountAmount:", discountAmount, typeof discountAmount);
-    console.log("is discountAmount > originalTotal?", discountAmount > originalTotal);
+    console.log("is discountAmount > total?", discountAmount > total);
     console.log("------------------------");
 
     if (
@@ -61,8 +61,7 @@ exports.createSale = async (req, res) => {
       typeof total !== "number" ||
       typeof profit !== "number" ||
       originalTotal < 0 ||
-      total < 0 ||
-      profit < 0
+      total < 0
     ) {
       console.log("❌ Financial validation failed:");
       if (typeof originalTotal !== "number") console.log("- originalTotal is not a number");
@@ -70,7 +69,6 @@ exports.createSale = async (req, res) => {
       if (typeof profit !== "number") console.log("- profit is not a number");
       if (originalTotal < 0) console.log("- originalTotal < 0");
       if (total < 0) console.log("- total < 0");
-      if (profit < 0) console.log("- profit < 0");
 
       return res.status(400).json({
         success: false,
@@ -85,8 +83,8 @@ exports.createSale = async (req, res) => {
       });
     }
 
-    // التحقق من أن التخفيض لا يتجاوز الإجمالي
-    if (discountAmount > originalTotal) {
+    // التحقق من أن التخفيض لا يتجاوز الإجمالي قبل التخفيض
+    if (discountAmount > total) {
       return res.status(400).json({
         success: false,
         message: "مبلغ التخفيض لا يمكن أن يكون أكبر من الإجمالي قبل التخفيض",
