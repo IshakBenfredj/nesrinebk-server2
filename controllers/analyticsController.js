@@ -2673,6 +2673,25 @@ exports.getProfitHistory = async (req, res) => {
       }
     });
 
+    const allCashAdjustments = await BonusAdjustment.find({
+      type: "cash_deduction",
+    }).lean();
+    allCashAdjustments.forEach((adj) => {
+      const adjDate = new Date(adj.createdAt);
+      if (inPeriod(adjDate)) {
+        const amt = Math.abs(adj.amount);
+        if (amt > 0) {
+          totalBonusPaid += amt;
+          bonusEntries.push({
+            timestamp: adjDate,
+            label: `سحب نقدي — ${adj.reason || "سحب نقدي من البونص"}`,
+            amount: amt,
+            type: "bonus_payment",
+          });
+        }
+      }
+    });
+
     /* ══════════════════════════════════════════════════════════
        4.  BUILD TIMELINE
        ══════════════════════════════════════════════════════════ */

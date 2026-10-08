@@ -362,11 +362,75 @@ exports.getWorkerBonus = async (req, res) => {
       });
     }
 
-    // Find the single pending period
-    const period = await BonusPeriod.findOne({
+    // Find the pending period
+    let period = await BonusPeriod.findOne({
       user: workerId,
       status: "pending",
-    }).lean();
+    });
+
+    // ─────────────────────────────────────────────────────────────
+    // AUTO-HEAL: Check if worker has previous carryover adjustment
+    // to seamlessly restore their 400 gross bonus and -300 cash deduction
+    // ─────────────────────────────────────────────────────────────
+    if (period) {
+      const carryoverAdj = await BonusAdjustment.findOne({
+        period: period._id,
+        reason: "رصيد متبقي محجوز ومرحل من سحب سابق",
+      });
+
+      if (carryoverAdj) {
+        const lastPaidPeriod = await BonusPeriod.findOne({
+          user: workerId,
+          status: "paid",
+        }).sort({ paidAt: -1, updatedAt: -1 });
+
+        if (lastPaidPeriod) {
+          const withdrawnAmount = lastPaidPeriod.finalBonus || 0;
+          const grossBefore =
+            (lastPaidPeriod.bonusAmount || 0) > 0
+              ? lastPaidPeriod.bonusAmount
+              : withdrawnAmount + carryoverAdj.amount;
+
+          // Delete the temporary carryover adjustment and split period
+          await BonusAdjustment.findByIdAndDelete(carryoverAdj._id);
+          await BonusPeriod.findByIdAndDelete(period._id);
+
+          // Restore lastPaidPeriod as active pending period
+          lastPaidPeriod.status = "pending";
+          lastPaidPeriod.endDate = null;
+          lastPaidPeriod.bonusAmount = grossBefore;
+          lastPaidPeriod.note = "فترة نشطة";
+
+          // Create the proper cash_deduction adjustment
+          await BonusAdjustment.create({
+            period: lastPaidPeriod._id,
+            amount: -Math.abs(withdrawnAmount),
+            reason:
+              lastPaidPeriod.note && lastPaidPeriod.note.includes("العامل")
+                ? "سحب نقدي من طرف العامل"
+                : "دفع مستحقات نقداً من قبل الإدارة",
+            type: "cash_deduction",
+            createdBy: lastPaidPeriod.paidBy || workerId,
+            createdAt: lastPaidPeriod.paidAt || new Date(),
+          });
+
+          const allPeriodAdjustments = await BonusAdjustment.find({
+            period: lastPaidPeriod._id,
+          });
+          lastPaidPeriod.adjustmentsTotal = allPeriodAdjustments.reduce(
+            (sum, a) => sum + a.amount,
+            0,
+          );
+          lastPaidPeriod.finalBonus = Math.max(
+            0,
+            lastPaidPeriod.bonusAmount + lastPaidPeriod.adjustmentsTotal,
+          );
+          await lastPaidPeriod.save();
+
+          period = lastPaidPeriod;
+        }
+      }
+    }
 
     if (!period) {
       return res.json({
@@ -381,6 +445,7 @@ exports.getWorkerBonus = async (req, res) => {
         adjustments: [],
         totalUnpaidBonus: 0,
         totalCashWithdrawn: 0,
+        grossBonus: 0,
       });
     }
 
@@ -389,15 +454,26 @@ exports.getWorkerBonus = async (req, res) => {
       period: period._id,
     })
       .populate("createdBy", "name")
+      .sort({ createdAt: -1 })
       .lean();
-
-    console.log("All adjustments for period:", allAdjustments);
-
-    const bonusValue = period.finalBonus || 0;
 
     const periodCash = allAdjustments
       .filter((a) => a.type === "cash_deduction")
       .reduce((sum, a) => sum + Math.abs(a.amount), 0);
+
+    const bonusAdjustmentsTotal = allAdjustments
+      .filter((a) => a.type === "bonus_only")
+      .reduce((sum, a) => sum + a.amount, 0);
+
+    const grossBonus = (period.bonusAmount || 0) + bonusAdjustmentsTotal;
+    const bonusValue = Math.max(0, grossBonus - periodCash);
+
+    // Make sure period fields stay in sync
+    if (period.finalBonus !== bonusValue) {
+      period.adjustmentsTotal = allAdjustments.reduce((s, a) => s + a.amount, 0);
+      period.finalBonus = bonusValue;
+      await period.save();
+    }
 
     const resultPeriod = {
       _id: period._id,
@@ -407,7 +483,7 @@ exports.getWorkerBonus = async (req, res) => {
       totalBonus: bonusValue,
       details: {
         salesBonus: period.bonusAmount || 0,
-        bonusAdjustments: period.adjustmentsTotal || 0,
+        bonusAdjustments: bonusAdjustmentsTotal,
         cashWithdrawn: periodCash,
       },
     };
@@ -420,10 +496,11 @@ exports.getWorkerBonus = async (req, res) => {
         phone: worker.phone,
         bonusPercentage: worker.bonusPercentage || 0,
       },
-      unpaidPeriods: [resultPeriod], // always one pending period
-      adjustments: allAdjustments, // all adjustments for this period
+      unpaidPeriods: [resultPeriod],
+      adjustments: allAdjustments,
       totalUnpaidBonus: bonusValue,
       totalCashWithdrawn: periodCash,
+      grossBonus,
     });
   } catch (err) {
     console.error("Get worker bonus error:", err);
@@ -478,9 +555,7 @@ exports.payWorkerBonus = async (req, res) => {
       });
     }
 
-    // Use the amount sent from frontend instead of recalculating
     const totalToPay = Number(amount);
-
     if (isNaN(totalToPay) || totalToPay <= 0) {
       return res.status(400).json({
         success: false,
@@ -495,62 +570,43 @@ exports.payWorkerBonus = async (req, res) => {
       });
     }
 
-    const remainingAmount = availableBonus - totalToPay;
     const now = new Date();
     const isWorkerSelf = req.user._id.toString() === workerId.toString();
-    const actionNote = isWorkerSelf
-      ? "سحب مستحقات من طرف العامل"
-      : "دفع مستحقات من قبل الإدارة";
+    const actionReason = isWorkerSelf
+      ? "سحب نقدي من طرف العامل"
+      : "دفع مستحقات نقداً من قبل الإدارة";
 
-    // Close the pending period with the paid/withdrawn amount
-    period.status = "paid";
-    period.paidAt = now;
-    period.finalBonus = totalToPay;
-    period.paidBy = req.user._id;
-    period.endDate = now;
-    period.note = actionNote;
+    // 1. Record the cash_deduction adjustment with negative amount
+    const withdrawalAdj = await BonusAdjustment.create({
+      period: period._id,
+      amount: -Math.abs(totalToPay),
+      reason: actionReason,
+      type: "cash_deduction",
+      createdBy: req.user._id,
+      createdAt: now,
+    });
+
+    // 2. Recompute period adjustments and final bonus
+    const allPeriodAdjustments = await BonusAdjustment.find({
+      period: period._id,
+    });
+    period.adjustmentsTotal = allPeriodAdjustments.reduce(
+      (sum, a) => sum + a.amount,
+      0,
+    );
+    period.finalBonus = Math.max(
+      0,
+      (period.bonusAmount || 0) + period.adjustmentsTotal,
+    );
     await period.save();
 
-    // Check BonusConfig for auto new period
-    let config = await BonusConfig.findOne();
-    if (!config) {
-      config = await BonusConfig.create({ isEnabled: false });
-    }
-
-    let newPeriod = null;
-    // Always open a new pending period if bonus system is enabled OR if there is remaining balance to preserve!
-    if (config.isEnabled || remainingAmount > 0) {
-      newPeriod = await BonusPeriod.create({
-        user: workerId,
-        startDate: now,
-        endDate: null,
-        status: "pending",
-        note:
-          remainingAmount > 0
-            ? "رصيد متبقي محجوز ومرحل من سحب سابق"
-            : "تم إنشاؤها تلقائياً بعد السحب",
-        bonusAmount: 0,
-        adjustmentsTotal: remainingAmount,
-        finalBonus: remainingAmount,
-      });
-
-      // Create carryover adjustment if there is a remainder
-      if (remainingAmount > 0) {
-        await BonusAdjustment.create({
-          period: newPeriod._id,
-          amount: remainingAmount,
-          reason: "رصيد متبقي محجوز ومرحل من سحب سابق",
-          createdBy: req.user._id,
-          type: "bonus_only",
-        });
-      }
-    }
+    const remainingAmount = period.finalBonus;
 
     return res.json({
       success: true,
       paidAmount: totalToPay,
       remainingAmount,
-      newPeriodCreated: !!newPeriod,
+      data: withdrawalAdj,
       message:
         remainingAmount > 0
           ? `تم سحب ${totalToPay.toLocaleString("ar-DZ")} د.ج بنجاح، والمبلغ المتبقي ${remainingAmount.toLocaleString("ar-DZ")} د.ج محجوز في رصيدك.`
@@ -598,22 +654,31 @@ exports.createAdjustment = async (req, res) => {
         message: "لا يمكن إضافة تعديلات إلى فترة مغلقة أو مدفوعة",
       });
     }
+
+    const parsedAmount =
+      type === "cash_deduction" ? -Math.abs(Number(amount)) : Number(amount);
+
     const adjustment = await BonusAdjustment.create({
       period: periodId,
-      amount: Number(amount),
+      amount: parsedAmount,
       reason,
       createdBy: req.user._id,
       type,
     });
 
-    if (type === "bonus_only") {
-      period.adjustmentsTotal += Number(amount);
-      period.finalBonus += Number(amount);
-      await period.save();
-    } else if (type === "cash_deduction") {
-      period.finalBonus += Number(amount);
-      await period.save();
-    }
+    const allPeriodAdjustments = await BonusAdjustment.find({
+      period: periodId,
+    });
+    period.adjustmentsTotal = allPeriodAdjustments.reduce(
+      (sum, a) => sum + a.amount,
+      0,
+    );
+    period.finalBonus = Math.max(
+      0,
+      (period.bonusAmount || 0) + period.adjustmentsTotal,
+    );
+    await period.save();
+
     return res.status(201).json({
       success: true,
       data: adjustment,
@@ -664,7 +729,7 @@ exports.deleteAdjustment = async (req, res) => {
     }
 
     const period = await BonusPeriod.findById(adjustment.period);
-    if (period.status !== "pending") {
+    if (!period || period.status !== "pending") {
       return res.status(400).json({
         success: false,
         message: "لا يمكن حذف تعديلات من فترة مغلقة أو مدفوعة",
@@ -673,14 +738,18 @@ exports.deleteAdjustment = async (req, res) => {
 
     await BonusAdjustment.findByIdAndDelete(adjustmentId);
 
-    if (adjustment.type === "bonus_only") {
-      period.adjustmentsTotal -= adjustment.amount;
-      period.finalBonus -= adjustment.amount
-      await period.save();
-    } else if (adjustment.type === "cash_deduction") {
-      period.finalBonus -= adjustment.amount
-      await period.save();
-    }
+    const allPeriodAdjustments = await BonusAdjustment.find({
+      period: period._id,
+    });
+    period.adjustmentsTotal = allPeriodAdjustments.reduce(
+      (sum, a) => sum + a.amount,
+      0,
+    );
+    period.finalBonus = Math.max(
+      0,
+      (period.bonusAmount || 0) + period.adjustmentsTotal,
+    );
+    await period.save();
 
     return res.json({
       success: true,
