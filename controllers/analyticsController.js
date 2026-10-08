@@ -450,18 +450,18 @@ exports.getFullSummary = async (req, res) => {
 
     // 3. All periods bonus (global sum)
     const allPeriods = await BonusPeriod.find({ status: "paid" })
-      .select("finalBonus bonusAmount startDate")
+      .select("finalBonus bonusAmount startDate paidAt")
       .lean();
     const allTimePeriodsBonus = allPeriods.reduce((sum, period) => {
       return sum + (period.finalBonus || period.bonusAmount || 0);
     }, 0);
 
-    // 4. Filtered periods bonus (by startDate)
+    // 4. Filtered periods bonus (by paidAt || startDate)
     let filteredPeriodsBonus = 0;
     if (allPeriods.length > 0) {
       const periodDateMatches = makeDateMatcher(type, singleDate, from, to);
       filteredPeriodsBonus = allPeriods.reduce((sum, period) => {
-        const periodDate = new Date(period.startDate);
+        const periodDate = new Date(period.paidAt || period.startDate);
         return periodDateMatches(periodDate)
           ? sum + (period.finalBonus || 0)
           : sum;
@@ -1084,7 +1084,7 @@ exports.getRevenueHistory = async (req, res) => {
       status: "paid",
       paidAt: { $gte: startOfDay, $lte: endOfDay },
     })
-      .select("finalBonus bonusAmount paidAt user startDate")
+      .select("finalBonus bonusAmount paidAt user startDate note")
       .lean();
 
     const changes = [];
@@ -1205,14 +1205,14 @@ exports.getRevenueHistory = async (req, res) => {
       });
     });
 
-    // ── 5. دفع فترات البونص (الجديد) ──
+    // ── 5. دفع فترات البونص ──
     dayPaidPeriods.forEach((period) => {
       const bonusAmount = period.finalBonus || period.bonusAmount || 0;
       if (bonusAmount > 0) {
         changes.push({
           type: "bonus_payment",
           description: `دفع بونص — ${period.note ? period.note : "فترة بونص"}`,
-          amount: +bonusAmount,           // خروج نقدي
+          amount: -Math.abs(bonusAmount),           // خروج نقدي من ماكينة الدفع
           timestamp: period.paidAt,
           relatedId: period._id,
         });
@@ -2651,6 +2651,29 @@ exports.getProfitHistory = async (req, res) => {
     });
 
     /* ══════════════════════════════════════════════════════════
+       3.5.  BONUS PAYMENTS (deducted from profit, like expenses)
+       ══════════════════════════════════════════════════════════ */
+    const allPaidPeriods = await BonusPeriod.find({ status: "paid" }).lean();
+    const bonusEntries = [];
+    let totalBonusPaid = 0;
+
+    allPaidPeriods.forEach((period) => {
+      const paidDate = new Date(period.paidAt || period.startDate);
+      if (inPeriod(paidDate)) {
+        const bonusAmount = period.finalBonus || period.bonusAmount || 0;
+        if (bonusAmount > 0) {
+          totalBonusPaid += bonusAmount;
+          bonusEntries.push({
+            timestamp: paidDate,
+            label: `دفع بونص — ${period.note || "مستحقات بونص"}`,
+            amount: bonusAmount,
+            type: "bonus_payment",
+          });
+        }
+      }
+    });
+
+    /* ══════════════════════════════════════════════════════════
        4.  BUILD TIMELINE
        ══════════════════════════════════════════════════════════ */
     const timeline = [];
@@ -2692,6 +2715,18 @@ exports.getProfitHistory = async (req, res) => {
       });
     });
 
+    bonusEntries.forEach((e) => {
+      timeline.push({
+        timestamp: e.timestamp,
+        time: fmtTime(e.timestamp),
+        date: fmtDate(e.timestamp),
+        type: "bonus_payment",
+        label: e.label,
+        impact: -e.amount, // − deducts from profit
+        expenseAmount: e.amount,
+      });
+    });
+
     timeline.sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
 
     /* running profit */
@@ -2701,7 +2736,7 @@ exports.getProfitHistory = async (req, res) => {
       entry.runningProfit = Math.round(running);
     });
 
-    const netProfit = totalSalesProfit + totalOrdersProfit - totalExpenses;
+    const netProfit = totalSalesProfit + totalOrdersProfit - totalExpenses - totalBonusPaid;
 
     /* ── group by date for chart ── */
     const byDate = {};
@@ -2716,7 +2751,7 @@ exports.getProfitHistory = async (req, res) => {
           net: 0,
         };
       if (e.type === "order") byDate[d].ordersProfit += e.impact;
-      else if (e.type === "expense") byDate[d].expenses += e.expenseAmount;
+      else if (e.type === "expense" || e.type === "bonus_payment") byDate[d].expenses += e.expenseAmount;
       else byDate[d].salesProfit += e.impact;
       byDate[d].net += e.impact;
     });
@@ -2732,6 +2767,7 @@ exports.getProfitHistory = async (req, res) => {
         salesProfit: Math.round(totalSalesProfit),
         ordersProfit: Math.round(totalOrdersProfit),
         expenses: Math.round(totalExpenses),
+        bonusPaid: Math.round(totalBonusPaid),
         netProfit: Math.round(netProfit),
         count: timeline.length,
       },

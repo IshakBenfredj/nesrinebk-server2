@@ -439,6 +439,17 @@ exports.payWorkerBonus = async (req, res) => {
     const { workerId } = req.params;
     const { amount } = req.body;
 
+    // Authorization: Admin or Worker themselves
+    if (
+      req.user.role !== "admin" &&
+      req.user._id.toString() !== workerId.toString()
+    ) {
+      return res.status(403).json({
+        success: false,
+        message: "غير مصرح لك بإجراء هذه العملية",
+      });
+    }
+
     const worker = await User.findById(workerId);
     if (!worker || worker.role !== "worker") {
       return res.status(404).json({
@@ -455,36 +466,50 @@ exports.payWorkerBonus = async (req, res) => {
     if (!period) {
       return res.status(400).json({
         success: false,
-        message: "لا توجد فترات معلقة للدفع",
+        message: "لا توجد فترات معلقة للدفع أو السحب",
+      });
+    }
+
+    const availableBonus = period.finalBonus || 0;
+    if (availableBonus <= 0) {
+      return res.status(400).json({
+        success: false,
+        message: "لا يوجد رصيد بونص مستحق للسحب",
       });
     }
 
     // Use the amount sent from frontend instead of recalculating
     const totalToPay = Number(amount);
 
-    if (totalToPay <= 0) {
+    if (isNaN(totalToPay) || totalToPay <= 0) {
       return res.status(400).json({
         success: false,
-        message: "المبلغ المطلوب للدفع غير صالح",
+        message: "المبلغ المطلوب للسحب غير صالح",
       });
     }
 
-    const now = new Date();
+    if (totalToPay > availableBonus) {
+      return res.status(400).json({
+        success: false,
+        message: `المبلغ المطلوب (${totalToPay.toLocaleString("ar-DZ")} د.ج) أكبر من الرصيد المتاح (${availableBonus.toLocaleString("ar-DZ")} د.ج)`,
+      });
+    }
 
-    // Close all pending periods
-    const updateResult = await BonusPeriod.updateOne(
-      { user: workerId, status: "pending" },
-      {
-        $set: {
-          status: "paid",
-          paidAt: now,
-          finalBonus: totalToPay,
-          paidBy: req.user._id,
-          endDate: now,
-          note: "دفع يدوي من قبل الإدارة",
-        },
-      },
-    );
+    const remainingAmount = availableBonus - totalToPay;
+    const now = new Date();
+    const isWorkerSelf = req.user._id.toString() === workerId.toString();
+    const actionNote = isWorkerSelf
+      ? "سحب مستحقات من طرف العامل"
+      : "دفع مستحقات من قبل الإدارة";
+
+    // Close the pending period with the paid/withdrawn amount
+    period.status = "paid";
+    period.paidAt = now;
+    period.finalBonus = totalToPay;
+    period.paidBy = req.user._id;
+    period.endDate = now;
+    period.note = actionNote;
+    await period.save();
 
     // Check BonusConfig for auto new period
     let config = await BonusConfig.findOne();
@@ -493,33 +518,49 @@ exports.payWorkerBonus = async (req, res) => {
     }
 
     let newPeriod = null;
-    if (config.isEnabled) {
+    // Always open a new pending period if bonus system is enabled OR if there is remaining balance to preserve!
+    if (config.isEnabled || remainingAmount > 0) {
       newPeriod = await BonusPeriod.create({
         user: workerId,
         startDate: now,
         endDate: null,
         status: "pending",
-        note: "تم إنشاؤها تلقائياً بعد الدفع",
+        note:
+          remainingAmount > 0
+            ? "رصيد متبقي محجوز ومرحل من سحب سابق"
+            : "تم إنشاؤها تلقائياً بعد السحب",
         bonusAmount: 0,
-        adjustmentsTotal: 0,
-        finalBonus: 0,
+        adjustmentsTotal: remainingAmount,
+        finalBonus: remainingAmount,
       });
+
+      // Create carryover adjustment if there is a remainder
+      if (remainingAmount > 0) {
+        await BonusAdjustment.create({
+          period: newPeriod._id,
+          amount: remainingAmount,
+          reason: "رصيد متبقي محجوز ومرحل من سحب سابق",
+          createdBy: req.user._id,
+          type: "bonus_only",
+        });
+      }
     }
 
     return res.json({
       success: true,
       paidAmount: totalToPay,
-      updatedPeriods: updateResult.modifiedCount,
+      remainingAmount,
       newPeriodCreated: !!newPeriod,
-      message: config.isEnabled
-        ? `تم دفع ${totalToPay.toLocaleString("ar-DZ")} د.ج وفتح فترة جديدة`
-        : `تم دفع ${totalToPay.toLocaleString("ar-DZ")} د.ج بنجاح`,
+      message:
+        remainingAmount > 0
+          ? `تم سحب ${totalToPay.toLocaleString("ar-DZ")} د.ج بنجاح، والمبلغ المتبقي ${remainingAmount.toLocaleString("ar-DZ")} د.ج محجوز في رصيدك.`
+          : `تم سحب ${totalToPay.toLocaleString("ar-DZ")} د.ج بنجاح بالكامل.`,
     });
   } catch (err) {
     console.error("Pay worker bonus error:", err);
     return res.status(500).json({
       success: false,
-      message: "حدث خطأ في دفع البونص",
+      message: "حدث خطأ في سحب البونص",
     });
   }
 };

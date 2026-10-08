@@ -5,7 +5,7 @@ const Order = require("../models/Order");
 const StockHistory = require("../models/StockHistory");
 const ProductHistory = require("../models/ProductHistory");
 
-const { generateBarcode } = require("../utils/barcodeGenerator");
+const { generateBarcode, generateUniqueBarcode } = require("../utils/barcodeGenerator");
 const { uploadMultipleImages, deleteFileByUrl } = require("../utils/r2Storage");
 
 exports.createProduct = async (req, res) => {
@@ -55,21 +55,28 @@ exports.createProduct = async (req, res) => {
     }
 
     // ✅ معالجة الألوان وتعيين روابط الصور والباركود
-    const processedColors = colors.map((color) => {
-      const validImages = Array.isArray(color.images)
-        ? color.images.filter(
-            (img) => typeof img === "string" && img.startsWith("http"),
-          )
-        : [];
-      return {
-        ...color,
-        images: validImages,
-        sizes: (color.sizes || []).map((size) => ({
-          ...size,
-          barcode: size.barcode || generateBarcode(),
-        })),
-      };
-    });
+    const processedColors = await Promise.all(
+      colors.map(async (color) => {
+        const validImages = Array.isArray(color.images)
+          ? color.images.filter(
+              (img) => typeof img === "string" && img.startsWith("http"),
+            )
+          : [];
+        const processedSizes = await Promise.all(
+          (color.sizes || []).map(async (size) => ({
+            ...size,
+            size: String(size.size).trim().toUpperCase(),
+            quantity: typeof size.quantity === "number" ? size.quantity : Number(size.quantity) || 0,
+            barcode: size.barcode?.trim() || (await generateUniqueBarcode()),
+          }))
+        );
+        return {
+          ...color,
+          images: validImages,
+          sizes: processedSizes,
+        };
+      })
+    );
 
     const product = new Product({
       name,
@@ -732,31 +739,72 @@ exports.updateProduct = async (req, res) => {
     console.log("New Name from body:", name);
 
     // ==================== PROCESS COLORS & IMAGES ====================
-    const processedColors = colors.map((color) => {
-      const existingColor = product.colors.find(
-        (c) => c.color === color.color,
-      );
+    const processedColors = await Promise.all(
+      colors.map(async (color) => {
+        const existingColor = product.colors.find(
+          (c) => (c.color || "").toLowerCase() === (color.color || "").toLowerCase(),
+        );
 
-      const validImages = Array.isArray(color.images)
-        ? color.images.filter(
-            (img) => typeof img === "string" && img.startsWith("http"),
-          )
-        : [];
+        const validImages = Array.isArray(color.images)
+          ? color.images.filter(
+              (img) => typeof img === "string" && img.startsWith("http"),
+            )
+          : [];
 
-      return {
-        ...color,
-        images: validImages,
-        sizes: (color.sizes || []).map((size) => {
-          const existingSize = existingColor?.sizes?.find(
-            (s) => s.size === size.size,
-          );
-          return {
-            ...size,
-            barcode: existingSize?.barcode || generateBarcode(),
-          };
-        }),
-      };
-    });
+        const processedSizes = await Promise.all(
+          (color.sizes || []).map(async (size) => {
+            // 1. Maintain barcode if provided from frontend
+            let barcode = size.barcode ? String(size.barcode).trim() : null;
+
+            // 2. If not provided, search for existing size in existingColor or across product
+            if (!barcode) {
+              let existingSize = existingColor?.sizes?.find(
+                (s) =>
+                  s.size.trim().toLowerCase() ===
+                  String(size.size).trim().toLowerCase(),
+              );
+              if (!existingSize) {
+                for (const c of product.colors) {
+                  const found = c.sizes?.find(
+                    (s) =>
+                      s.size.trim().toLowerCase() ===
+                      String(size.size).trim().toLowerCase(),
+                  );
+                  if (found) {
+                    existingSize = found;
+                    break;
+                  }
+                }
+              }
+              if (existingSize?.barcode) {
+                barcode = existingSize.barcode;
+              }
+            }
+
+            // 3. Only generate a new barcode if this size genuinely has no barcode
+            if (!barcode) {
+              barcode = await generateUniqueBarcode();
+            }
+
+            return {
+              ...size,
+              size: String(size.size).trim().toUpperCase(),
+              quantity:
+                typeof size.quantity === "number"
+                  ? size.quantity
+                  : Number(size.quantity) || 0,
+              barcode,
+            };
+          }),
+        );
+
+        return {
+          ...color,
+          images: validImages,
+          sizes: processedSizes,
+        };
+      }),
+    );
 
     // Delete removed images from R2
     const oldAllImages = oldData.colors.flatMap((c) => c.images || []);
@@ -825,10 +873,12 @@ exports.updateProduct = async (req, res) => {
     }
 
     // Color / Size / Image changes
-    const oldColorsMap = new Map(oldData.colors.map((c) => [c.color, c]));
+    const oldColorsMap = new Map(
+      oldData.colors.map((c) => [(c.color || "").toLowerCase(), c]),
+    );
 
     processedColors.forEach((newColor) => {
-      const oldColor = oldColorsMap.get(newColor.color);
+      const oldColor = oldColorsMap.get((newColor.color || "").toLowerCase());
 
       if (!oldColor) {
         // New color added
@@ -845,11 +895,18 @@ exports.updateProduct = async (req, res) => {
           worker: userId,
         });
       } else {
-        const oldSizesMap = new Map(oldColor.sizes.map((s) => [s.size, s]));
+        const oldSizesByBarcode = new Map(
+          oldColor.sizes.map((s) => [s.barcode, s]),
+        );
+        const oldSizesByName = new Map(
+          oldColor.sizes.map((s) => [s.size.trim().toUpperCase(), s]),
+        );
 
         // New or changed sizes
         newColor.sizes.forEach((newSize) => {
-          const oldSize = oldSizesMap.get(newSize.size);
+          const oldSize =
+            (newSize.barcode ? oldSizesByBarcode.get(newSize.barcode) : null) ||
+            oldSizesByName.get(newSize.size.trim().toUpperCase());
 
           if (!oldSize) {
             historyDocs.push({
@@ -866,29 +923,56 @@ exports.updateProduct = async (req, res) => {
               size: newSize.size,
               worker: userId,
             });
-          } else if (oldSize.quantity !== newSize.quantity) {
-            const changeAmount = newSize.quantity - oldSize.quantity;
-            historyDocs.push({
-              productId: product._id,
-              productName: name,
-              action: "stock_changed",
-              details: {
+          } else {
+            // Check if size was renamed
+            if (oldSize.size !== newSize.size) {
+              historyDocs.push({
+                productId: product._id,
+                productName: name,
+                action: "size_updated",
+                details: {
+                  color: newColor.color,
+                  oldSize: oldSize.size,
+                  newSize: newSize.size,
+                  barcode: newSize.barcode,
+                },
                 color: newColor.color,
                 size: newSize.size,
-                oldQuantity: oldSize.quantity,
-                newQuantity: newSize.quantity,
-                changeAmount,
-              },
-              color: newColor.color,
-              size: newSize.size,
-              worker: userId,
-            });
+                worker: userId,
+              });
+            }
+
+            // Check if stock quantity changed
+            if (oldSize.quantity !== newSize.quantity) {
+              const changeAmount = newSize.quantity - oldSize.quantity;
+              historyDocs.push({
+                productId: product._id,
+                productName: name,
+                action: "stock_changed",
+                details: {
+                  color: newColor.color,
+                  size: newSize.size,
+                  oldQuantity: oldSize.quantity,
+                  newQuantity: newSize.quantity,
+                  changeAmount,
+                  barcode: newSize.barcode,
+                },
+                color: newColor.color,
+                size: newSize.size,
+                worker: userId,
+              });
+            }
           }
         });
 
         // Removed sizes
         oldColor.sizes.forEach((oldSize) => {
-          if (!newColor.sizes.some((ns) => ns.size === oldSize.size)) {
+          const stillExists = newColor.sizes.some(
+            (ns) =>
+              (ns.barcode && ns.barcode === oldSize.barcode) ||
+              ns.size.trim().toUpperCase() === oldSize.size.trim().toUpperCase(),
+          );
+          if (!stillExists) {
             historyDocs.push({
               productId: product._id,
               productName: name,
@@ -897,6 +981,7 @@ exports.updateProduct = async (req, res) => {
                 color: newColor.color,
                 size: oldSize.size,
                 oldQuantity: oldSize.quantity,
+                barcode: oldSize.barcode,
               },
               color: newColor.color,
               size: oldSize.size,
@@ -940,7 +1025,12 @@ exports.updateProduct = async (req, res) => {
 
     // Removed colors
     oldData.colors.forEach((oldColor) => {
-      if (!processedColors.some((nc) => nc.color === oldColor.color)) {
+      if (
+        !processedColors.some(
+          (nc) =>
+            (nc.color || "").toLowerCase() === (oldColor.color || "").toLowerCase(),
+        )
+      ) {
         historyDocs.push({
           productId: product._id,
           productName: name,
