@@ -3,6 +3,7 @@ const User = require("../models/User");
 const BonusConfig = require("../models/BonusConfig");
 const BonusPeriod = require("../models/BonusPeriod");
 const BonusAdjustment = require("../models/BonusAdjustment");
+const Sale = require("../models/Sale");
 
 const getConfig = async () => {
   let config = await BonusConfig.findOne();
@@ -404,7 +405,7 @@ exports.getWorkerBonus = async (req, res) => {
       .reduce((sum, a) => sum + a.amount, 0);
 
     const grossBonus = (period.bonusAmount || 0) + bonusAdjustmentsTotal;
-    const bonusValue = Math.max(0, grossBonus - periodCash);
+    const bonusValue = grossBonus - periodCash;
 
     // Make sure period fields stay in sync
     if (period.finalBonus !== bonusValue) {
@@ -412,6 +413,82 @@ exports.getWorkerBonus = async (req, res) => {
       period.finalBonus = bonusValue;
       await period.save();
     }
+
+    // ── Monthly Bonus Statistics ──
+    const now = new Date();
+    const currentMonthKey = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}`;
+
+    const monthNames = [
+      "جانفي", "فيفري", "مارس", "أفريل", "ماي", "جوان",
+      "جويلية", "أوت", "سبتمبر", "أكتوبر", "نوفمبر", "ديسمبر"
+    ];
+
+    const sales = await Sale.find({
+      cashier: workerId,
+      bonusAmount: { $gt: 0 },
+    })
+      .select("bonusAmount createdAt")
+      .lean();
+
+    const monthlyMap = {};
+
+    const getMonthKey = (d) => {
+      const date = new Date(d);
+      return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}`;
+    };
+
+    sales.forEach((s) => {
+      const key = getMonthKey(s.createdAt);
+      if (!monthlyMap[key]) {
+        const [y, m] = key.split("-");
+        monthlyMap[key] = {
+          monthKey: key,
+          monthLabel: `${monthNames[parseInt(m) - 1]} ${y}`,
+          earnedBonus: 0,
+          paidBonus: 0,
+          salesCount: 0,
+        };
+      }
+      monthlyMap[key].earnedBonus += s.bonusAmount || 0;
+      monthlyMap[key].salesCount += 1;
+    });
+
+    allAdjustments.forEach((a) => {
+      const key = getMonthKey(a.createdAt);
+      if (!monthlyMap[key]) {
+        const [y, m] = key.split("-");
+        monthlyMap[key] = {
+          monthKey: key,
+          monthLabel: `${monthNames[parseInt(m) - 1]} ${y}`,
+          earnedBonus: 0,
+          paidBonus: 0,
+          salesCount: 0,
+        };
+      }
+      if (a.amount < 0) {
+        monthlyMap[key].paidBonus += Math.abs(a.amount);
+      }
+    });
+
+    if (!monthlyMap[currentMonthKey]) {
+      const [cy, cm] = currentMonthKey.split("-");
+      monthlyMap[currentMonthKey] = {
+        monthKey: currentMonthKey,
+        monthLabel: `${monthNames[parseInt(cm) - 1]} ${cy}`,
+        earnedBonus: 0,
+        paidBonus: 0,
+        salesCount: 0,
+      };
+    }
+
+    const sortedMonths = Object.values(monthlyMap).sort((a, b) =>
+      b.monthKey.localeCompare(a.monthKey)
+    );
+
+    const thisMonthData = monthlyMap[currentMonthKey] || { earnedBonus: 0, paidBonus: 0 };
+    const thisMonthPaid = thisMonthData.paidBonus;
+    const thisMonthEarned = thisMonthData.earnedBonus;
+    const currentMonthLabel = thisMonthData.monthLabel;
 
     const resultPeriod = {
       _id: period._id,
@@ -439,6 +516,10 @@ exports.getWorkerBonus = async (req, res) => {
       totalUnpaidBonus: bonusValue,
       totalCashWithdrawn: periodCash,
       grossBonus,
+      monthlyStats: sortedMonths,
+      thisMonthPaid,
+      thisMonthEarned,
+      currentMonthLabel,
     });
   } catch (err) {
     console.error("Get worker bonus error:", err);
@@ -481,15 +562,7 @@ exports.payWorkerBonus = async (req, res) => {
     if (!period) {
       return res.status(400).json({
         success: false,
-        message: "لا توجد فترات معلقة للدفع أو السحب",
-      });
-    }
-
-    const availableBonus = period.finalBonus || 0;
-    if (availableBonus <= 0) {
-      return res.status(400).json({
-        success: false,
-        message: "لا يوجد رصيد بونص مستحق للسحب",
+        message: "لا توجد محفظة بونص نشطة",
       });
     }
 
@@ -498,13 +571,6 @@ exports.payWorkerBonus = async (req, res) => {
       return res.status(400).json({
         success: false,
         message: "المبلغ المطلوب للسحب غير صالح",
-      });
-    }
-
-    if (totalToPay > availableBonus) {
-      return res.status(400).json({
-        success: false,
-        message: `المبلغ المطلوب (${totalToPay.toLocaleString("ar-DZ")} د.ج) أكبر من الرصيد المتاح (${availableBonus.toLocaleString("ar-DZ")} د.ج)`,
       });
     }
 
@@ -524,7 +590,7 @@ exports.payWorkerBonus = async (req, res) => {
       createdAt: now,
     });
 
-    // 2. Recompute period adjustments and final bonus
+    // 2. Recompute period adjustments and final bonus (allowing negative wallet balance)
     const allPeriodAdjustments = await BonusAdjustment.find({
       period: period._id,
     });
@@ -532,23 +598,27 @@ exports.payWorkerBonus = async (req, res) => {
       (sum, a) => sum + a.amount,
       0,
     );
-    period.finalBonus = Math.max(
-      0,
-      (period.bonusAmount || 0) + period.adjustmentsTotal,
-    );
+    period.finalBonus =
+      (period.bonusAmount || 0) + period.adjustmentsTotal;
     await period.save();
 
     const remainingAmount = period.finalBonus;
+
+    let responseMsg = "";
+    if (remainingAmount > 0) {
+      responseMsg = `تم سحب ${totalToPay.toLocaleString("ar-DZ")} د.ج بنجاح، والمبلغ المتبقي في المحفظة ${remainingAmount.toLocaleString("ar-DZ")} د.ج.`;
+    } else if (remainingAmount === 0) {
+      responseMsg = `تم سحب ${totalToPay.toLocaleString("ar-DZ")} د.ج بنجاح بالكامل (الرصيد الحالي 0 د.ج).`;
+    } else {
+      responseMsg = `تم سحب ${totalToPay.toLocaleString("ar-DZ")} د.ج بنجاح، وأصبح رصيد المحفظة بالسالب (${remainingAmount.toLocaleString("ar-DZ")} د.ج سلفة).`;
+    }
 
     return res.json({
       success: true,
       paidAmount: totalToPay,
       remainingAmount,
       data: withdrawalAdj,
-      message:
-        remainingAmount > 0
-          ? `تم سحب ${totalToPay.toLocaleString("ar-DZ")} د.ج بنجاح، والمبلغ المتبقي ${remainingAmount.toLocaleString("ar-DZ")} د.ج محجوز في رصيدك.`
-          : `تم سحب ${totalToPay.toLocaleString("ar-DZ")} د.ج بنجاح بالكامل.`,
+      message: responseMsg,
     });
   } catch (err) {
     console.error("Pay worker bonus error:", err);
@@ -611,10 +681,8 @@ exports.createAdjustment = async (req, res) => {
       (sum, a) => sum + a.amount,
       0,
     );
-    period.finalBonus = Math.max(
-      0,
-      (period.bonusAmount || 0) + period.adjustmentsTotal,
-    );
+    period.finalBonus =
+      (period.bonusAmount || 0) + period.adjustmentsTotal;
     await period.save();
 
     return res.status(201).json({
@@ -683,10 +751,8 @@ exports.deleteAdjustment = async (req, res) => {
       (sum, a) => sum + a.amount,
       0,
     );
-    period.finalBonus = Math.max(
-      0,
-      (period.bonusAmount || 0) + period.adjustmentsTotal,
-    );
+    period.finalBonus =
+      (period.bonusAmount || 0) + period.adjustmentsTotal;
     await period.save();
 
     return res.json({
