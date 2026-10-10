@@ -53,26 +53,10 @@ exports.createSale = async (req, res) => {
     console.log("total:", total, typeof total);
     console.log("profit:", profit, typeof profit);
     console.log("discountAmount:", discountAmount, typeof discountAmount);
-    console.log("is discountAmount > total?", discountAmount > total);
-    console.log("------------------------");
-
-    if (
-      typeof originalTotal !== "number" ||
-      typeof total !== "number" ||
-      typeof profit !== "number" ||
-      originalTotal < 0 ||
-      total < 0
-    ) {
-      console.log("❌ Financial validation failed:");
-      if (typeof originalTotal !== "number") console.log("- originalTotal is not a number");
-      if (typeof total !== "number") console.log("- total is not a number");
-      if (typeof profit !== "number") console.log("- profit is not a number");
-      if (originalTotal < 0) console.log("- originalTotal < 0");
-      if (total < 0) console.log("- total < 0");
-
+    if (typeof total !== "number" || total < 0) {
       return res.status(400).json({
         success: false,
-        message: "البيانات المالية غير صالحة",
+        message: "إجمالي المبلغ غير صالح",
       });
     }
 
@@ -153,16 +137,29 @@ exports.createSale = async (req, res) => {
         });
       }
 
+      const itemOriginalPrice =
+        product && typeof product.originalPrice === "number"
+          ? product.originalPrice
+          : typeof item.originalPrice === "number"
+          ? item.originalPrice
+          : 0;
+
       saleItems.push({
         product: product._id,
         barcode: item.barcode,
         quantity: item.quantity,
         price: item.price,
-        originalPrice: item.originalPrice,
+        originalPrice: itemOriginalPrice,
         size: item.size,
         color: item.color,
       });
     }
+
+    const calculatedOriginalTotal = saleItems.reduce(
+      (sum, it) => sum + (it.originalPrice || 0) * (it.quantity || 1),
+      0,
+    );
+    const calculatedProfit = total - calculatedOriginalTotal;
 
     const uniqueBarcode = await generateUniqueBarcode();
 
@@ -170,9 +167,9 @@ exports.createSale = async (req, res) => {
       barcode: uniqueBarcode,
       items: saleItems,
       total,
-      originalTotal,
+      originalTotal: calculatedOriginalTotal,
       discountAmount,
-      profit,
+      profit: calculatedProfit,
       cashier,
       isPrePaid,
       prepaidAmount,

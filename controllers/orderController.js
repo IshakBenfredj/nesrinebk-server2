@@ -85,6 +85,13 @@ exports.createOrder = async (req, res) => {
           .json({ success: false, message: "المنتج غير موجود" });
       }
 
+      item.originalPrice =
+        product && typeof product.originalPrice === "number"
+          ? product.originalPrice
+          : typeof item.originalPrice === "number"
+          ? item.originalPrice
+          : 0;
+
       let foundSize = null;
       for (const color of product.colors) {
         for (const size of color.sizes) {
@@ -138,6 +145,12 @@ exports.createOrder = async (req, res) => {
       }
     }
 
+    const calculatedOriginalTotal = items.reduce(
+      (sum, it) => sum + (it.originalPrice || 0) * (it.quantity || 1),
+      0,
+    );
+    const calculatedProfit = total - calculatedOriginalTotal;
+
     const orderNumber = await getNextOrderNumber();
 
     const newOrder = await Order.create({
@@ -149,8 +162,8 @@ exports.createOrder = async (req, res) => {
       orderNumber,
       items,
       total,
-      originalTotal,
-      profit,
+      originalTotal: calculatedOriginalTotal,
+      profit: calculatedProfit,
       discountAmount,
       notes,
       isPaid,
@@ -329,6 +342,13 @@ exports.updateOrder = async (req, res) => {
           .status(404)
           .json({ success: false, message: "منتج غير موجود" });
 
+      item.originalPrice =
+        product && typeof product.originalPrice === "number"
+          ? product.originalPrice
+          : typeof item.originalPrice === "number"
+          ? item.originalPrice
+          : 0;
+
       const foundSize = product.colors
         .flatMap((c) => c.sizes)
         .find((s) => s.barcode === item.barcode);
@@ -368,6 +388,12 @@ exports.updateOrder = async (req, res) => {
       }
     }
 
+    const calculatedOriginalTotal = items.reduce(
+      (sum, it) => sum + (it.originalPrice || 0) * (it.quantity || 1),
+      0,
+    );
+    const calculatedProfit = total - calculatedOriginalTotal;
+
     // Apply new stock decrease if needed
     if (newShouldDecrease) {
       for (const item of items) {
@@ -390,8 +416,8 @@ exports.updateOrder = async (req, res) => {
         address: deliveryType === "منزل" ? address : "",
         items,
         total,
-        originalTotal,
-        profit,
+        originalTotal: calculatedOriginalTotal,
+        profit: calculatedProfit,
         discountAmount,
         notes,
         isPaid,
