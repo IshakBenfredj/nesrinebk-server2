@@ -468,6 +468,19 @@ exports.getFullSummary = async (req, res) => {
       }, 0);
     }
 
+    // Bonus withdrawals for the selected period (cash deductions + paid periods)
+    let filteredCashDeductionsTotal = 0;
+    if (allAdjustments.length > 0) {
+      const adjDateMatches = makeDateMatcher(type, singleDate, from, to);
+      filteredCashDeductionsTotal = allAdjustments.reduce((sum, adj) => {
+        if (adj.type !== "cash_deduction") return sum;
+        const adjDate = new Date(adj.createdAt);
+        return adjDateMatches(adjDate) ? sum + Math.abs(adj.amount || 0) : sum;
+      }, 0);
+    }
+
+    const bonusWithdrawalsTotal = filteredCashDeductionsTotal;
+
     /* ── 8. Final totals ── */
 
     // TURNOVER: sum of sales revenue + orders revenue in the selected period
@@ -512,6 +525,11 @@ exports.getFullSummary = async (req, res) => {
         allTimeNonFixed,
       },
       revenueChanges: allTimeRevenueChanges,
+      bonusWithdrawals: {
+        total: bonusWithdrawalsTotal,
+        cashDeductions: filteredCashDeductionsTotal,
+        paidPeriods: filteredPeriodsBonus,
+      },
       capital: {
         totalCapital,
         totalOCapital,
@@ -2653,7 +2671,9 @@ exports.getProfitHistory = async (req, res) => {
     /* ══════════════════════════════════════════════════════════
        3.5.  BONUS PAYMENTS (deducted from profit, like expenses)
        ══════════════════════════════════════════════════════════ */
-    const allPaidPeriods = await BonusPeriod.find({ status: "paid" }).lean();
+    const allPaidPeriods = await BonusPeriod.find({ status: "paid" })
+      .populate("user", "name")
+      .lean();
     const bonusEntries = [];
     let totalBonusPaid = 0;
 
@@ -2663,9 +2683,10 @@ exports.getProfitHistory = async (req, res) => {
         const bonusAmount = period.finalBonus || period.bonusAmount || 0;
         if (bonusAmount > 0) {
           totalBonusPaid += bonusAmount;
+          const userName = period.user?.name ? ` (${period.user.name})` : "";
           bonusEntries.push({
             timestamp: paidDate,
-            label: `دفع بونص — ${period.note || "مستحقات بونص"}`,
+            label: `دفع بونص — ${period.note || "مستحقات بونص"}${userName}`,
             amount: bonusAmount,
             type: "bonus_payment",
           });
@@ -2675,18 +2696,33 @@ exports.getProfitHistory = async (req, res) => {
 
     const allCashAdjustments = await BonusAdjustment.find({
       type: "cash_deduction",
-    }).lean();
+    })
+      .populate({
+        path: "period",
+        select: "user",
+        populate: { path: "user", select: "name" },
+      })
+      .populate("createdBy", "name")
+      .lean();
+
     allCashAdjustments.forEach((adj) => {
       const adjDate = new Date(adj.createdAt);
       if (inPeriod(adjDate)) {
         const amt = Math.abs(adj.amount);
         if (amt > 0) {
           totalBonusPaid += amt;
+          const workerName = adj.period?.user?.name || adj.createdBy?.name || "";
+          const nameSuffix = workerName ? ` (${workerName})` : "";
+          const reasonText = adj.reason || "سحب نقدي من البونص";
+          const labelText = reasonText.startsWith("سحب نقدي")
+            ? `${reasonText}${nameSuffix}`
+            : `سحب نقدي — ${reasonText}${nameSuffix}`;
+
           bonusEntries.push({
             timestamp: adjDate,
-            label: `سحب نقدي — ${adj.reason || "سحب نقدي من البونص"}`,
+            label: labelText,
             amount: amt,
-            type: "bonus_payment",
+            type: "cash_deduction",
           });
         }
       }
@@ -2739,7 +2775,7 @@ exports.getProfitHistory = async (req, res) => {
         timestamp: e.timestamp,
         time: fmtTime(e.timestamp),
         date: fmtDate(e.timestamp),
-        type: "bonus_payment",
+        type: e.type,
         label: e.label,
         impact: -e.amount, // − deducts from profit
         expenseAmount: e.amount,
@@ -2770,7 +2806,12 @@ exports.getProfitHistory = async (req, res) => {
           net: 0,
         };
       if (e.type === "order") byDate[d].ordersProfit += e.impact;
-      else if (e.type === "expense" || e.type === "bonus_payment") byDate[d].expenses += e.expenseAmount;
+      else if (
+        e.type === "expense" ||
+        e.type === "bonus_payment" ||
+        e.type === "cash_deduction"
+      )
+        byDate[d].expenses += e.expenseAmount;
       else byDate[d].salesProfit += e.impact;
       byDate[d].net += e.impact;
     });

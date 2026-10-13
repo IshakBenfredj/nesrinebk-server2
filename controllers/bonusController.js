@@ -36,7 +36,9 @@ exports.toggleBonus = async (req, res) => {
     // When ENABLE bonus
     // ─────────────────────────────────────────────────────────────
     if (isEnabled && !wasEnabled) {
-      const workers = await User.find({ role: "worker" }).select("_id");
+      const workers = await User.find({
+        role: { $in: ["worker", "admin"] },
+      }).select("_id");
 
       const newPeriods = [];
 
@@ -356,10 +358,10 @@ exports.getWorkerBonus = async (req, res) => {
     const { workerId } = req.params;
 
     const worker = await User.findById(workerId);
-    if (!worker || worker.role !== "worker") {
+    if (!worker || !["worker", "admin"].includes(worker.role)) {
       return res.status(404).json({
         success: false,
-        message: "العامل غير موجود",
+        message: "المستخدم غير موجود",
       });
     }
 
@@ -547,10 +549,10 @@ exports.payWorkerBonus = async (req, res) => {
     }
 
     const worker = await User.findById(workerId);
-    if (!worker || worker.role !== "worker") {
+    if (!worker || !["worker", "admin"].includes(worker.role)) {
       return res.status(404).json({
         success: false,
-        message: "العامل غير موجود أو ليس له صلاحية worker",
+        message: "المستخدم غير موجود أو ليس له صلاحية",
       });
     }
 
@@ -767,3 +769,105 @@ exports.deleteAdjustment = async (req, res) => {
     });
   }
 };
+
+exports.getDailyBonusWithdrawals = async (req, res) => {
+  try {
+    const { date, type = "day", from, to } = req.query;
+
+    let startDate, endDate;
+    if (type === "range" && from && to) {
+      startDate = new Date(from);
+      startDate.setHours(0, 0, 0, 0);
+      endDate = new Date(to);
+      endDate.setHours(23, 59, 59, 999);
+    } else {
+      const targetDate = date || new Date().toISOString().split("T")[0];
+      startDate = new Date(targetDate);
+      startDate.setHours(0, 0, 0, 0);
+      endDate = new Date(targetDate);
+      endDate.setHours(23, 59, 59, 999);
+    }
+
+    // 1. Fetch ONLY cash_deduction adjustments (السحوبات النقدية) matching date range
+    const adjustments = await BonusAdjustment.find({
+      type: "cash_deduction",
+      createdAt: { $gte: startDate, $lte: endDate },
+    })
+      .populate({
+        path: "period",
+        populate: {
+          path: "user",
+          select: "name phone role",
+        },
+      })
+      .populate("createdBy", "name phone role")
+      .sort({ createdAt: -1 })
+      .lean();
+
+    const withdrawals = adjustments.map((adj) => {
+      const beneficiary = adj.period?.user || null;
+      const amountVal = Math.abs(adj.amount || 0);
+
+      return {
+        _id: adj._id,
+        type: "cash_deduction",
+        typeLabel: "سحب نقدي",
+        amount: amountVal,
+        rawAmount: adj.amount,
+        reason: adj.reason || "سحب نقدي من المحفظة",
+        date: adj.createdAt,
+        periodId: adj.period?._id,
+        user: beneficiary
+          ? {
+              _id: beneficiary._id,
+              name: beneficiary.name,
+              phone: beneficiary.phone,
+              role: beneficiary.role,
+            }
+          : null,
+        executor: adj.createdBy
+          ? {
+              _id: adj.createdBy._id,
+              name: adj.createdBy.name,
+              role: adj.createdBy.role,
+            }
+          : null,
+      };
+    });
+
+    withdrawals.sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
+
+    const totalAmount = withdrawals.reduce((sum, w) => sum + w.amount, 0);
+    const workerWithdrawals = withdrawals.filter(
+      (w) => (w.user?.role || "worker") === "worker"
+    );
+    const adminWithdrawals = withdrawals.filter((w) => w.user?.role === "admin");
+    const workerTotal = workerWithdrawals.reduce((sum, w) => sum + w.amount, 0);
+    const adminTotal = adminWithdrawals.reduce((sum, w) => sum + w.amount, 0);
+
+    return res.json({
+      success: true,
+      startDate,
+      endDate,
+      totalAmount,
+      cashDeductionsTotal: totalAmount,
+      bonusPaymentsTotal: 0,
+      bonusAdjustmentsTotal: 0,
+      workerTotal,
+      adminTotal,
+      workerCount: workerWithdrawals.length,
+      adminCount: adminWithdrawals.length,
+      withdrawalsCount: withdrawals.length,
+      operationsCount: withdrawals.length,
+      withdrawals,
+      allOperations: withdrawals,
+    });
+  } catch (err) {
+    console.error("Get daily bonus withdrawals error:", err);
+    return res.status(500).json({
+      success: false,
+      message: "حدث خطأ في جلب سحوبات البونص",
+    });
+  }
+};
+
