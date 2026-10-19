@@ -5,6 +5,10 @@ const Product = require("../models/Product");
 const RevenueChanges = require("../models/RevenuesChanges");
 const BonusAdjustment = require("../models/BonusAdjustment");
 const BonusPeriod = require("../models/BonusPeriod");
+const {
+  getExpenseFirstDueDate,
+  isMonthlyExpenseDueOnSpecificDate,
+} = require("../utils/expenseHelpers");
 
 function makeDateMatcher(type, singleDate, from, to) {
   if (type === "day") {
@@ -246,15 +250,18 @@ function computeExpenses(expenses, type, singleDate, from, to) {
 
     /* ══════════════════════════════════════════════════════════════
        FIXED MONTHLY
-       يُحسب في نفس رقم اليوم من كل شهر >= شهر الإنشاء
+       يُحسب في يوم الاستحقاق المحدد (dueDay) ابتداءً من أول تاريخ استحقاق (firstDueDate)
        ══════════════════════════════════════════════════════════════ */
     if (exp.isFixed && exp.recurrence === "monthly") {
+      const dueDay = exp.dueDay || createdDay;
+      const firstDue = getExpenseFirstDueDate(exp);
+      firstDue.setHours(0, 0, 0, 0);
+
       if (type === "day") {
         const selectedDate = new Date(singleDate);
-        selectedDate.setHours(12, 0, 0, 0);
+        selectedDate.setHours(0, 0, 0, 0);
         if (
-          selectedDate.getDate() === createdDay &&
-          selectedDate >= createdStart
+          isMonthlyExpenseDueOnSpecificDate(dueDay, firstDue, selectedDate)
         ) {
           totalExpenses += exp.amount;
         }
@@ -264,22 +271,22 @@ function computeExpenses(expenses, type, singleDate, from, to) {
         const rangeEnd = new Date(to);
         rangeEnd.setHours(23, 59, 59, 999);
         const effectiveStart =
-          createdStart > rangeStart ? createdStart : rangeStart;
+          firstDue > rangeStart ? firstDue : rangeStart;
         if (effectiveStart > rangeEnd) return;
 
         let count = 0;
-        const cursor = new Date(effectiveStart);
-        cursor.setDate(1); // أول الشهر الفعّال
+        const cursor = new Date(effectiveStart.getFullYear(), effectiveStart.getMonth(), 1);
 
         while (cursor <= rangeEnd) {
-          const dueDate = new Date(
-            cursor.getFullYear(),
-            cursor.getMonth(),
-            createdDay,
-          );
+          const year = cursor.getFullYear();
+          const month = cursor.getMonth();
+          const maxDays = new Date(year, month + 1, 0).getDate();
+          const actualDueDay = Math.min(dueDay, maxDays);
+          const dueDate = new Date(year, month, actualDueDay);
           dueDate.setHours(12, 0, 0, 0);
+
           if (
-            dueDate >= effectiveStart &&
+            dueDate >= firstDue &&
             dueDate >= rangeStart &&
             dueDate <= rangeEnd
           ) {
@@ -381,7 +388,7 @@ exports.getFullSummary = async (req, res) => {
 
     /* ── 4. Expenses ── */
     const allExpenses = await Expense.find()
-      .select("createdAt isFixed recurrence amount admin")
+      .select("createdAt isFixed recurrence amount admin dueDay firstDueDate")
       .lean();
     const { totalExpenses, adminExpenses } = computeExpenses(
       allExpenses,
@@ -2112,12 +2119,13 @@ function buildDateRange(type, date, from, to) {
    ═══════════════════════════════════════════════════════ */
 /* ═══════════════════════════════════════════════════════
    HELPER: هل يوم معين يُطابق المصروف الثابت الشهري؟
-   monthly → يظهر في نفس رقم اليوم من كل شهر
+   monthly → يظهر في يوم الاستحقاق المحدد ويكون >= أول تاريخ استحقاق
    ═══════════════════════════════════════════════════════ */
 function isMonthlyExpenseDueOnDate(expense, date) {
-  const createdDay = new Date(expense.createdAt).getDate(); // رقم اليوم عند الإنشاء (مثلاً 26)
-  const checkDay = new Date(date).getDate(); // رقم اليوم المراد فحصه
-  return createdDay === checkDay;
+  const dueDay = expense.dueDay || new Date(expense.createdAt).getDate();
+  const firstDue = getExpenseFirstDueDate(expense);
+  const checkDate = new Date(date + "T00:00:00");
+  return isMonthlyExpenseDueOnSpecificDate(dueDay, firstDue, checkDate);
 }
 
 /* ═══════════════════════════════════════════════════════
@@ -2248,10 +2256,16 @@ exports.getExpensesHistory = async (req, res) => {
             fixedTotal += exp.amount;
           });
         } else if (exp.recurrence === "monthly") {
-          // ثابت شهري → يظهر في كل يوم ضمن النطاق يُطابق رقم يوم الإنشاء
-          const createdDay = createdAt.getDate();
+          // ثابت شهري → يظهر في كل يوم ضمن النطاق يُطابق رقم يوم الاستحقاق ويكون >= أول تاريخ استحقاق
+          const dueDay = exp.dueDay || createdAt.getDate();
+          const firstDue = getExpenseFirstDueDate(exp);
+          firstDue.setHours(0, 0, 0, 0);
+
           daysInRange.forEach((day) => {
-            if (day.getDate() !== createdDay) return;
+            const dayStart = new Date(day);
+            dayStart.setHours(0, 0, 0, 0);
+            if (!isMonthlyExpenseDueOnSpecificDate(dueDay, firstDue, dayStart)) return;
+
             const entry = buildEntry(exp, exp.amount, day, "ثابت شهري");
             history.push(entry);
             totalExpenses += exp.amount;
@@ -2650,13 +2664,17 @@ exports.getProfitHistory = async (req, res) => {
         return;
       }
 
-      /* fixed monthly → one entry on the matching day-of-month each month */
+      /* fixed monthly → one entry on the matching due day each month >= firstDueDate */
       if (exp.recurrence === "monthly") {
+        const dueDay = exp.dueDay || createdDay;
+        const firstDue = getExpenseFirstDueDate(exp);
+        firstDue.setHours(0, 0, 0, 0);
+
         days.forEach((day) => {
           const dayStart = new Date(day);
           dayStart.setHours(0, 0, 0, 0);
-          if (dayStart < createdStart) return;
-          if (day.getDate() !== createdDay) return;
+          if (!isMonthlyExpenseDueOnSpecificDate(dueDay, firstDue, dayStart)) return;
+
           totalExpenses += exp.amount;
           expenseEntries.push({
             timestamp: new Date(dayStart),

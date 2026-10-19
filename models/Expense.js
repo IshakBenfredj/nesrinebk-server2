@@ -30,6 +30,14 @@ const ExpenseSchema = new mongoose.Schema(
       enum: ["daily", "monthly"],
       default: "monthly",
     },
+    dueDay: {
+      type: Number,
+      min: 1,
+      max: 31,
+    },
+    firstDueDate: {
+      type: Date,
+    },
   },
   { timestamps: true }
 );

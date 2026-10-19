@@ -1,9 +1,17 @@
 const Expense = require("../models/Expense");
+const { getMonthlyFirstDueDate } = require("../utils/expenseHelpers");
 
 // ➤ Add Expense
 exports.addExpense = async (req, res) => {
   try {
-    const { description, amount, admin = false, isFixed = false, recurrence = 'monthly' } = req.body;
+    const {
+      description,
+      amount,
+      admin = false,
+      isFixed = false,
+      recurrence = "monthly",
+      dueDay,
+    } = req.body;
     const user = req.user._id;
 
     if (!description || !amount || !user) {
@@ -12,14 +20,23 @@ exports.addExpense = async (req, res) => {
         .json({ success: false, message: "كل الحقول مطلوبة" });
     }
 
-    const expense = await Expense.create({
+    const now = new Date();
+    const expenseData = {
       description,
       amount,
       user,
       admin,
       isFixed,
-      recurrence
-    });
+      recurrence,
+    };
+
+    if (isFixed && recurrence === "monthly") {
+      const parsedDueDay = dueDay ? parseInt(dueDay, 10) : now.getDate();
+      expenseData.dueDay = parsedDueDay;
+      expenseData.firstDueDate = getMonthlyFirstDueDate(now, parsedDueDay);
+    }
+
+    const expense = await Expense.create(expenseData);
 
     await expense.populate("user", "name role");
     res.status(201).json({ success: true, data: expense });
@@ -31,13 +48,10 @@ exports.addExpense = async (req, res) => {
   }
 };
 
-// ➤ Get All Expenses
+// ➤ Get All Expenses (المصاريف العامة)
 exports.getExpenses = async (req, res) => {
   try {
-    const query = {};
-    if (req.user.role === "worker") {
-      query.admin = false;
-    }
+    const query = { admin: false, isFixed: { $ne: true } };
     const expenses = await Expense.find(query)
       .populate("user", "name role")
       .sort({ createdAt: -1 })
@@ -51,11 +65,12 @@ exports.getExpenses = async (req, res) => {
   }
 };
 
-// ➤ Get Fixed Expenses
+// ➤ Get Fixed Expenses (المصاريف الثابتة)
 exports.getFixedExpenses = async (req, res) => {
   try {
     const fixedExpenses = await Expense.find({ isFixed: true })
       .populate("user", "name role")
+      .sort({ createdAt: -1 })
       .lean();
     res.json({ success: true, data: fixedExpenses });
   } catch (err) {
@@ -66,10 +81,10 @@ exports.getFixedExpenses = async (req, res) => {
   }
 };
 
-// ➤ Get Admin Expenses
+// ➤ Get Admin Expenses (مصاريف المسؤولين)
 exports.getAdminExpenses = async (req, res) => {
   try {
-    const adminExpenses = await Expense.find({ admin: true })
+    const adminExpenses = await Expense.find({ admin: true, isFixed: { $ne: true } })
       .populate("user", "name role")
       .sort({ createdAt: -1 })
       .lean();
@@ -102,19 +117,35 @@ exports.getExpense = async (req, res) => {
 // ➤ Update Expense
 exports.updateExpense = async (req, res) => {
   try {
-    const { description, amount, admin, isFixed, recurrence } = req.body;
+    const { description, amount, admin, isFixed, recurrence, dueDay } = req.body;
 
     const updateData = {
       description,
       amount,
       admin,
       isFixed,
-      recurrence
+      recurrence,
     };
+
+    if (isFixed && recurrence === "monthly") {
+      const now = new Date();
+      const existing = await Expense.findById(req.params.id);
+      if (existing) {
+        const parsedDueDay = dueDay
+          ? parseInt(dueDay, 10)
+          : existing.dueDay || new Date(existing.createdAt).getDate();
+        updateData.dueDay = parsedDueDay;
+
+        // If dueDay changed or firstDueDate is missing, recalculate firstDueDate
+        if (!existing.firstDueDate || existing.dueDay !== parsedDueDay) {
+          updateData.firstDueDate = getMonthlyFirstDueDate(now, parsedDueDay);
+        }
+      }
+    }
 
     const expense = await Expense.findByIdAndUpdate(req.params.id, updateData, {
       new: true,
-    });
+    }).populate("user", "name role");
 
     if (!expense)
       return res

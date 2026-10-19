@@ -262,7 +262,8 @@ exports.exchangeProducts = async (req, res) => {
     const saleTime = new Date(sale.createdAt);
     const hoursDiff = (now - saleTime) / (1000 * 60 * 60);
 
-    if (hoursDiff > 48) {
+    const isAdmin = req.user && req.user.role === "admin";
+    if (!isAdmin && hoursDiff > 48) {
       return res.json({
         success: false,
         expired: true,
@@ -654,10 +655,11 @@ exports.getSaleById = async (req, res) => {
     const now = new Date();
     const saleTime = new Date(sale.createdAt);
     const hoursDiff = (now - saleTime) / (1000 * 60 * 60);
+    const isAdmin = req.user && req.user.role === "admin";
 
     res.json({
       success: true,
-      expired: hoursDiff > 50,
+      expired: !isAdmin && hoursDiff > 48,
       data: sale,
     });
   } catch (error) {
@@ -703,10 +705,11 @@ exports.getSaleByBarcode = async (req, res) => {
     const now = new Date();
     const saleTime = new Date(sale.createdAt);
     const hoursDiff = (now - saleTime) / (1000 * 60 * 60);
+    const isAdmin = req.user && req.user.role === "admin";
 
     res.json({
       success: true,
-      expired: hoursDiff > 50,
+      expired: !isAdmin && hoursDiff > 48,
       data: sale,
     });
   } catch (error) {
@@ -742,12 +745,13 @@ exports.exchangeProducts = async (req, res) => {
     const now = new Date();
     const saleTime = new Date(sale.createdAt);
     const hoursDiff = (now - saleTime) / (1000 * 60 * 60);
+    const isAdmin = req.user && req.user.role === "admin";
 
-    if (hoursDiff > 50) {
+    if (!isAdmin && hoursDiff > 48) {
       return res.json({
         success: false,
         expired: true,
-        message: "انتهت فترة الـ 50 ساعة المسموح بها للاستبدال",
+        message: "انتهت فترة الـ 48 ساعة المسموح بها للاستبدال",
       });
     }
 
