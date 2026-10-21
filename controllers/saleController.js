@@ -396,10 +396,6 @@ exports.exchangeProducts = async (req, res) => {
 
     await Promise.all(stockUpdates);
 
-    sale.totalBeforeExchange = sale.total;
-    sale.profitBeforeExchange = sale.profit;
-    sale.originalTotalBeforeExchange = sale.originalTotal;
-
     // Recalculate current totals after exchange
     sale.total = sale.items.reduce(
       (sum, item) => sum + item.quantity * item.price,
@@ -411,11 +407,44 @@ exports.exchangeProducts = async (req, res) => {
     );
     sale.profit = sale.total - sale.originalTotal;
 
-    // Mark as exchanged (only once)
+    // Adjust bonus if totals changed after exchange
+    const oldBonusAmount = sale.bonusAmount || 0;
+    let percentage = sale.bonusPercentageApplied;
+
+    if (percentage === undefined || percentage === null) {
+      const worker = await User.findById(sale.cashier).select("bonusPercentage");
+      percentage = worker ? worker.bonusPercentage : 0;
+      sale.bonusPercentageApplied = percentage;
+    }
+
+    if (percentage > 0) {
+      const base = sale.total - (sale.discountAmount || 0);
+      const newBonusAmount = Math.trunc(base * (percentage / 100));
+      const diff = newBonusAmount - oldBonusAmount;
+
+      if (diff !== 0) {
+        const period = await BonusPeriod.findOne({
+          user: sale.cashier,
+          status: "pending",
+          endDate: null,
+        });
+
+        if (period) {
+          period.bonusAmount += diff;
+          if (period.bonusAmount < 0) period.bonusAmount = 0;
+          period.finalBonus = period.bonusAmount + (period.adjustmentsTotal || 0);
+          await period.save();
+
+          sale.bonusAmount = newBonusAmount;
+        }
+      }
+    }
+
+    // Mark as exchanged
     sale.isExchanged = true;
     sale.exchanges.push(...exchangeRecords);
     sale.exchangeCashier = cashier;
-    sale.exchangedAt = new Date();
+    sale.exchangedAt = now;
 
     await sale.save();
 
@@ -721,228 +750,6 @@ exports.getSaleByBarcode = async (req, res) => {
   }
 };
 
-exports.exchangeProducts = async (req, res) => {
-  try {
-    const { saleId } = req.params;
-    const { exchanges } = req.body;
-    const cashier = req.user._id;
-
-    if (!exchanges || !Array.isArray(exchanges) || exchanges.length === 0) {
-      return res.status(400).json({
-        success: false,
-        message: "لا توجد عناصر للاستبدال",
-      });
-    }
-
-    const sale = await Sale.findById(saleId);
-    if (!sale) {
-      return res.status(404).json({
-        success: false,
-        message: "الفاتورة غير موجودة",
-      });
-    }
-
-    const now = new Date();
-    const saleTime = new Date(sale.createdAt);
-    const hoursDiff = (now - saleTime) / (1000 * 60 * 60);
-    const isAdmin = req.user && req.user.role === "admin";
-
-    if (!isAdmin && hoursDiff > 48) {
-      return res.json({
-        success: false,
-        expired: true,
-        message: "انتهت فترة الـ 48 ساعة المسموح بها للاستبدال",
-      });
-    }
-
-    const stockUpdates = [];
-    const exchangeRecords = [];
-    let totalOriginalAmount = 0;
-    let totalNewAmount = 0;
-    let totalOriginalCost = 0;
-    let totalNewCost = 0;
-
-    for (const exchange of exchanges) {
-      const { originalBarcode, newBarcode, newQuantity } = exchange;
-
-      if (newQuantity < 1) {
-        return res.status(400).json({
-          success: false,
-          message: `الكمية يجب أن تكون أكبر من الصفر للباركود: ${newBarcode}`,
-        });
-      }
-
-      const originalItem = sale.items.find(
-        (item) => item.barcode === originalBarcode,
-      );
-      if (!originalItem) {
-        return res.status(404).json({
-          success: false,
-          message: `المنتج الأصلي غير موجود في الفاتورة: ${originalBarcode}`,
-        });
-      }
-
-      const newProduct = await Product.findOne({
-        "colors.sizes.barcode": newBarcode,
-      });
-      if (!newProduct) {
-        return res.status(404).json({
-          success: false,
-          message: `المنتج الجديد غير موجود: ${newBarcode}`,
-        });
-      }
-
-      let newSize = null;
-      let newColor = null;
-
-      for (const color of newProduct.colors) {
-        for (const size of color.sizes) {
-          if (size.barcode === newBarcode) {
-            newSize = size;
-            newColor = color;
-            break;
-          }
-        }
-        if (newSize) break;
-      }
-
-      if (!newSize || !newColor) {
-        return res.status(404).json({
-          success: false,
-          message: `لم يتم العثور على المقاس أو اللون للباركود: ${newBarcode}`,
-        });
-      }
-
-      if (newSize.quantity < newQuantity) {
-        return res.status(400).json({
-          success: false,
-          message: `الكمية غير متوفرة للمنتج: ${newProduct.name} (${newSize.size}) - يتوفر ${newSize.quantity}`,
-        });
-      }
-
-      const exchangedItem = {
-        product: newProduct._id,
-        barcode: newBarcode,
-        quantity: newQuantity,
-        price: newProduct.price,
-        originalPrice: newProduct.originalPrice,
-        size: newSize.size,
-        color: newColor.color,
-      };
-
-      const originalAmount = originalItem.quantity * originalItem.price;
-      const newAmount = newQuantity * newProduct.price;
-      const priceDifference = newAmount - originalAmount;
-
-      const originalCost = originalItem.quantity * originalItem.originalPrice;
-      const newCost = newQuantity * newProduct.originalPrice;
-
-      stockUpdates.push(
-        updateProductStock(
-          originalItem.product,
-          originalItem.barcode,
-          originalItem.quantity,
-          false,
-        ),
-
-        updateProductStock(newProduct._id, newBarcode, -newQuantity, false),
-      );
-
-      sale.items = sale.items.map((item) =>
-        item.barcode === originalBarcode ? exchangedItem : item,
-      );
-
-      exchangeRecords.push({
-        originalItem,
-        exchangedWith: exchangedItem,
-        exchangedAt: now,
-        priceDifference,
-      });
-
-      totalOriginalAmount += originalAmount;
-      totalNewAmount += newAmount;
-      totalOriginalCost += originalCost;
-      totalNewCost += newCost;
-    }
-
-    await Promise.all(stockUpdates);
-
-    sale.total = sale.items.reduce(
-      (sum, item) => sum + item.quantity * item.price,
-      0,
-    );
-    sale.originalTotal = sale.items.reduce(
-      (sum, item) => sum + item.quantity * item.originalPrice,
-      0,
-    );
-    sale.profit = sale.total - sale.originalTotal;
-
-    // Adjust bonus if totals changed after exchange
-    const oldBonusAmount = sale.bonusAmount || 0;
-    let percentage = sale.bonusPercentageApplied;
-
-    if (percentage === undefined || percentage === null) {
-      const worker = await User.findById(sale.cashier).select("bonusPercentage");
-      percentage = worker ? worker.bonusPercentage : 0;
-      sale.bonusPercentageApplied = percentage;
-    }
-
-    if (percentage > 0) {
-      const base = sale.total - (sale.discountAmount || 0);
-      const newBonusAmount = Math.trunc(base * (percentage / 100));
-      const diff = newBonusAmount - oldBonusAmount;
-
-      if (diff !== 0) {
-        const period = await BonusPeriod.findOne({
-          user: sale.cashier,
-          status: "pending",
-          endDate: null,
-        });
-
-        if (period) {
-          period.bonusAmount += diff;
-          if (period.bonusAmount < 0) period.bonusAmount = 0;
-          period.finalBonus = period.bonusAmount + (period.adjustmentsTotal || 0);
-          await period.save();
-          
-          sale.bonusAmount = newBonusAmount;
-        }
-      }
-    }
-
-    sale.isExchanged = true;
-    sale.exchanges.push(...exchangeRecords);
-    sale.exchangeCashier = cashier;
-
-    await sale.save();
-
-    // await Promise.all([
-    //   updateDailyProfit(
-    //     saleTime,
-    //     -totalOriginalAmount,
-    //     -totalOriginalCost,
-    //     -(totalOriginalAmount - totalOriginalCost)
-    //   ),
-    //   updateDailyProfit(
-    //     now,
-    //     totalNewAmount,
-    //     totalNewCost,
-    //     totalNewAmount - totalNewCost
-    //   ),
-    // ]);
-
-    res.json({
-      success: true,
-      data: sale,
-    });
-  } catch (error) {
-    console.error("Error exchanging products:", error);
-    res.status(500).json({
-      success: false,
-      message: "حدث خطأ أثناء عملية الاستبدال",
-    });
-  }
-};
 
 exports.getAllSales = async (req, res) => {
   try {
@@ -975,6 +782,11 @@ exports.getAllSales = async (req, res) => {
         { "items.barcode": { $regex: escaped, $options: "i" } },
         { "items.product": { $in: productIds } },
         { cashier: { $in: userIds } },
+        { exchangeCashier: { $in: userIds } },
+        { "exchanges.originalItem.barcode": { $regex: escaped, $options: "i" } },
+        { "exchanges.exchangedWith.barcode": { $regex: escaped, $options: "i" } },
+        { "exchanges.originalItem.product": { $in: productIds } },
+        { "exchanges.exchangedWith.product": { $in: productIds } },
       ];
       // Search works across all records regardless of selected day!
     } else if (date) {
@@ -990,12 +802,18 @@ exports.getAllSales = async (req, res) => {
           59,
           999,
         );
-        query.createdAt = { $gte: start, $lte: end };
+        query.$or = [
+          { createdAt: { $gte: start, $lte: end } },
+          { "exchanges.exchangedAt": { $gte: start, $lte: end } },
+        ];
       } else if (range === "year") {
         const d = new Date(date);
         const start = new Date(d.getFullYear(), 0, 1, 0, 0, 0, 0);
         const end = new Date(d.getFullYear(), 11, 31, 23, 59, 59, 999);
-        query.createdAt = { $gte: start, $lte: end };
+        query.$or = [
+          { createdAt: { $gte: start, $lte: end } },
+          { "exchanges.exchangedAt": { $gte: start, $lte: end } },
+        ];
       } else if (range === "all") {
         // no date constraint
       } else {
@@ -1005,7 +823,10 @@ exports.getAllSales = async (req, res) => {
         const endDate = new Date(date);
         endDate.setHours(23, 59, 59, 999);
 
-        query.createdAt = { $gte: startDate, $lte: endDate };
+        query.$or = [
+          { createdAt: { $gte: startDate, $lte: endDate } },
+          { "exchanges.exchangedAt": { $gte: startDate, $lte: endDate } },
+        ];
       }
     }
 

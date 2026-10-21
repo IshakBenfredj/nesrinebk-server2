@@ -20,6 +20,42 @@ function makeDateMatcher(type, singleDate, from, to) {
   return (d) => d >= fromMs && d <= toMs;
 }
 
+function getSaleOriginalTotal(sale) {
+  if (sale.totalBeforeExchange != null && sale.totalBeforeExchange > 0) {
+    return sale.totalBeforeExchange;
+  }
+  if (sale.isExchanged && sale.exchanges && sale.exchanges.length > 0) {
+    const totalDiff = sale.exchanges.reduce(
+      (sum, ex) => sum + (ex.priceDifference || 0),
+      0
+    );
+    return sale.total - totalDiff;
+  }
+  return sale.total;
+}
+
+function getSaleOriginalProfit(sale) {
+  if (sale.profitBeforeExchange != null) {
+    return sale.profitBeforeExchange;
+  }
+  if (sale.isExchanged && sale.exchanges && sale.exchanges.length > 0) {
+    let totalProfitDiff = 0;
+    sale.exchanges.forEach((ex) => {
+      if (ex.originalItem && ex.exchangedWith) {
+        const origP =
+          (ex.originalItem.price - (ex.originalItem.originalPrice || 0)) *
+          (ex.originalItem.quantity || 1);
+        const newP =
+          (ex.exchangedWith.price - (ex.exchangedWith.originalPrice || 0)) *
+          (ex.exchangedWith.quantity || 1);
+        totalProfitDiff += newP - origP;
+      }
+    });
+    return sale.profit - totalProfitDiff;
+  }
+  return sale.profit;
+}
+
 function computeSalesForPeriod(sales, dateMatches) {
   let totalSales = 0;
   let profitSales = 0;
@@ -29,7 +65,11 @@ function computeSalesForPeriod(sales, dateMatches) {
     const finalPaymentAt = sale.finalPaymentAt
       ? new Date(sale.finalPaymentAt)
       : null;
-    const exchangedAt = sale.exchangedAt ? new Date(sale.exchangedAt) : null;
+    const exchangedAt = sale.exchangedAt
+      ? new Date(sale.exchangedAt)
+      : sale.exchanges?.[0]?.exchangedAt
+      ? new Date(sale.exchanges[0].exchangedAt)
+      : null;
 
     const discount = sale.discountAmount || 0;
     const prepaid = sale.prepaidAmount || 0;
@@ -37,15 +77,14 @@ function computeSalesForPeriod(sales, dateMatches) {
     const isExchanged = sale.isExchanged;
     const isCompleted = !!finalPaymentAt;
 
+    const totalBeforeExchange = getSaleOriginalTotal(sale);
+    const profitBeforeExchange = getSaleOriginalProfit(sale);
+
     // فارق السعر بعد الاستبدال = total الجديد - totalBeforeExchange
-    const priceDiff = isExchanged
-      ? sale.total - (sale.totalBeforeExchange || 0)
-      : 0;
+    const priceDiff = isExchanged ? sale.total - totalBeforeExchange : 0;
 
     // فارق الربح بعد الاستبدال
-    const profitDiff = isExchanged
-      ? sale.profit - (sale.profitBeforeExchange || 0)
-      : 0;
+    const profitDiff = isExchanged ? sale.profit - profitBeforeExchange : 0;
 
     /* ══════════════════════════════════
        A. بيع عادي (بدون دفع مسبق)
@@ -61,8 +100,8 @@ function computeSalesForPeriod(sales, dateMatches) {
         // بيع عادي + استبدال
         // القيمة الأصلية يوم البيع
         if (dateMatches(createdAt)) {
-          totalSales += sale.totalBeforeExchange || 0;
-          profitSales += sale.profitBeforeExchange || 0;
+          totalSales += totalBeforeExchange;
+          profitSales += profitBeforeExchange;
         }
         // فارق الاستبدال يوم exchangedAt
         if (exchangedAt && dateMatches(exchangedAt)) {
@@ -573,10 +612,22 @@ function computeSalesRevenue(sales, filter, opts = {}) {
     const finalAt = sale.finalPaymentAt ? new Date(sale.finalPaymentAt) : null;
     const createdAt = new Date(sale.createdAt);
 
+    const originalTotalBeforeExchange = getSaleOriginalTotal(sale);
+
     /* ── A. بيع عادي ── */
     if (!isPrePaid) {
+      // 1. في يوم البيع الأصلي: يدخل المبلغ الأصلي للفاتورة
       if (withinBound(createdAt)) {
-        revenue += sale.total - discount;
+        revenue += originalTotalBeforeExchange - discount;
+      }
+      // 2. في أيام الاستبدال: يدخل أو يخرج فارق السعر
+      if (sale.exchanges && sale.exchanges.length > 0) {
+        sale.exchanges.forEach((ex) => {
+          const exAt = new Date(ex.exchangedAt);
+          if (withinBound(exAt)) {
+            revenue += (ex.priceDifference || 0);
+          }
+        });
       }
       return;
     }
@@ -601,7 +652,7 @@ function computeSalesRevenue(sales, filter, opts = {}) {
         const exAt = new Date(ex.exchangedAt);
         if (!withinBound(exAt)) return;
 
-        let diff = ex.priceDifference;
+        let diff = ex.priceDifference || 0;
 
         // حماية: total الجديد أقل من المسبق + الفارق سالب → لا خصم
         if (diff < 0 && sale.total < prepaid) {
@@ -952,7 +1003,7 @@ exports.getRevenueHistory = async (req, res) => {
       ],
     })
       .select(
-        "createdAt finalPaymentAt exchanges isPrePaid prepaidAmount total discountAmount isExchanged"
+        "createdAt finalPaymentAt exchanges isPrePaid prepaidAmount total discountAmount isExchanged totalBeforeExchange"
       )
       .lean();
 
@@ -1016,7 +1067,7 @@ exports.getRevenueHistory = async (req, res) => {
       ],
     })
       .select(
-        "createdAt finalPaymentAt exchanges isPrePaid prepaidAmount total discountAmount isExchanged"
+        "createdAt finalPaymentAt exchanges isPrePaid prepaidAmount total discountAmount isExchanged totalBeforeExchange"
       )
       .lean();
 
@@ -1059,7 +1110,7 @@ exports.getRevenueHistory = async (req, res) => {
       0
     );
 
-    const totalRevenueUpToDate = Math.round(
+    let totalRevenueUpToDate = Math.round(
       salesRevUpToDate -
         totalExpUpToDate +
         totalRCUpToDate +
@@ -1078,7 +1129,7 @@ exports.getRevenueHistory = async (req, res) => {
       ],
     })
       .select(
-        "createdAt finalPaymentAt exchanges isPrePaid prepaidAmount total discountAmount isExchanged barcode"
+        "createdAt finalPaymentAt exchanges isPrePaid prepaidAmount total discountAmount isExchanged barcode totalBeforeExchange"
       )
       .lean();
 
@@ -1133,10 +1184,11 @@ exports.getRevenueHistory = async (req, res) => {
       /* بيع عادي */
       if (!isPrePaid) {
         if (createdInDay) {
+          const originalSaleAmount = getSaleOriginalTotal(sale);
           changes.push({
             type: "sale",
             description: `بيع عادي — ${sale.barcode || "غير معروف"}`,
-            amount: sale.total - discount,
+            amount: originalSaleAmount - discount,
             timestamp: sale.createdAt,
           });
         }
@@ -1260,6 +1312,9 @@ exports.getRevenueHistory = async (req, res) => {
         }),
       };
     });
+
+    // لضمان التطابق التام 100% بين البطاقة العلوية وأسفل الجدول
+    totalRevenueUpToDate = Math.round(running);
 
     return res.json({
       success: true,
@@ -2499,7 +2554,11 @@ exports.getProfitHistory = async (req, res) => {
       const finalPaymentAt = sale.finalPaymentAt
         ? new Date(sale.finalPaymentAt)
         : null;
-      const exchangedAt = sale.exchangedAt ? new Date(sale.exchangedAt) : null;
+      const exchangedAt = sale.exchangedAt
+        ? new Date(sale.exchangedAt)
+        : sale.exchanges?.[0]?.exchangedAt
+        ? new Date(sale.exchanges[0].exchangedAt)
+        : null;
 
       const discount = sale.discountAmount || 0;
       const prepaid = sale.prepaidAmount || 0;
@@ -2507,9 +2566,8 @@ exports.getProfitHistory = async (req, res) => {
       const isExchanged = sale.isExchanged;
       const isCompleted = !!finalPaymentAt;
 
-      const profitDiff = isExchanged
-        ? sale.profit - (sale.profitBeforeExchange || 0)
-        : 0;
+      const profitBeforeExchange = getSaleOriginalProfit(sale);
+      const profitDiff = isExchanged ? sale.profit - profitBeforeExchange : 0;
 
       /* A. Normal sale, no exchange */
       if (!isPrePaid && !isExchanged) {
@@ -2528,7 +2586,7 @@ exports.getProfitHistory = async (req, res) => {
       /* B. Normal sale + exchange */
       if (!isPrePaid && isExchanged) {
         if (inPeriod(createdAt)) {
-          const p = sale.profitBeforeExchange || 0;
+          const p = profitBeforeExchange;
           totalSalesProfit += p;
           saleEntries.push({
             timestamp: createdAt,
