@@ -40,19 +40,19 @@ exports.login = async (req, res) => {
 
     const token = generateToken(user);
 
-    const ua = req.useragent;
-
-    await AuthHistory.create({
-      user: user._id,
-      userAgent: req.headers["user-agent"] || "Unknown",
-      isMobile: ua.isMobile,
-      isTablet: ua.isTablet,
-      isDesktop: ua.isDesktop,
-      browser: ua.browser ? `${ua.browser} ${ua.version || ""}` : "Unknown",
-      os: ua.os ? `${ua.os} (${ua.platform || ""})` : "Unknown",
-      deviceBrand: getDeviceBrand(ua),
-      type: "login",
-    });
+    // تم تعطيل تسجيل الدخول في السجل مؤقتاً - يمكن استعادته بإزالة التعليق:
+    // const ua = req.useragent;
+    // await AuthHistory.create({
+    //   user: user._id,
+    //   userAgent: req.headers["user-agent"] || "Unknown",
+    //   isMobile: ua.isMobile,
+    //   isTablet: ua.isTablet,
+    //   isDesktop: ua.isDesktop,
+    //   browser: ua.browser ? `${ua.browser} ${ua.version || ""}` : "Unknown",
+    //   os: ua.os ? `${ua.os} (${ua.platform || ""})` : "Unknown",
+    //   deviceBrand: getDeviceBrand(ua),
+    //   type: "login",
+    // });
 
     res.json({
       success: true,
@@ -67,20 +67,20 @@ exports.login = async (req, res) => {
 
 exports.logout = async (req, res) => {
   try {
-    const { tabClosed } = req.body;
-    const ua = req.useragent;
-
-    await AuthHistory.create({
-      user: req.user._id,
-      userAgent: req.headers["user-agent"] || "Unknown",
-      isMobile: ua.isMobile,
-      isTablet: ua.isTablet,
-      isDesktop: ua.isDesktop,
-      browser: ua.browser ? `${ua.browser} ${ua.version || ""}` : "Unknown",
-      os: ua.os ? `${ua.os} (${ua.platform || ""})` : "Unknown",
-      deviceBrand: getDeviceBrand(ua),
-      type: tabClosed ? "tab_closed" : "logout",
-    });
+    // تم تعطيل تسجيل الخروج في السجل مؤقتاً - يمكن استعادته بإزالة التعليق:
+    // const { tabClosed } = req.body;
+    // const ua = req.useragent;
+    // await AuthHistory.create({
+    //   user: req.user._id,
+    //   userAgent: req.headers["user-agent"] || "Unknown",
+    //   isMobile: ua.isMobile,
+    //   isTablet: ua.isTablet,
+    //   isDesktop: ua.isDesktop,
+    //   browser: ua.browser ? `${ua.browser} ${ua.version || ""}` : "Unknown",
+    //   os: ua.os ? `${ua.os} (${ua.platform || ""})` : "Unknown",
+    //   deviceBrand: getDeviceBrand(ua),
+    //   type: tabClosed ? "tab_closed" : "logout",
+    // });
 
     res.status(200).json({
       success: true,

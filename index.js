@@ -18,6 +18,7 @@ const todo = require("./routes/todoRoutes");
 const bonusRoutes = require("./routes/bonusRoutes");
 const productHistory = require("./routes/productHistory");
 const uploadRoutes = require("./routes/uploadRoutes");
+const coordinationRoutes = require("./routes/coordinationRoutes");
 const job = require("./utils/cron");
 const useragent = require('express-useragent');
 
@@ -82,6 +83,7 @@ app.use("/api/todos", todo);
 app.use("/api/bonus", bonusRoutes);
 app.use("/api/product-history", productHistory);
 app.use("/api/uploads", uploadRoutes);
+app.use("/api/coordinations", coordinationRoutes);
 
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => {
