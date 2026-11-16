@@ -208,40 +208,48 @@ exports.updateOrderStatus = async (req, res) => {
         .json({ success: false, message: "الطلبية غير موجودة" });
 
     const oldStatus = order.status;
-    if (status !== undefined) {
+    let statusChanged = false;
+
+    if (status !== undefined && status !== oldStatus) {
       order.status = status;
       order.statusUpdatedAt = new Date();
+      statusChanged = true;
     }
+
     if (handedToShipping !== undefined) {
       order.handedToShipping = handedToShipping;
     }
+
     await order.save();
 
-    const shouldDecreaseNew = status !== "غير مؤكدة" && status !== "ارجاع";
-    const shouldDecreaseOld =
-      oldStatus !== "غير مؤكدة" && oldStatus !== "ارجاع";
+    // Only adjust physical stock if status actually changed
+    if (statusChanged && status !== undefined) {
+      const shouldDecreaseNew = status !== "غير مؤكدة" && status !== "ارجاع";
+      const shouldDecreaseOld =
+        oldStatus !== "غير مؤكدة" && oldStatus !== "ارجاع";
 
-    // ✅ إذا كانت الحالة الجديدة يجب أن تنقص المخزون والحالة القديمة لا
-    if (shouldDecreaseNew && !shouldDecreaseOld) {
-      for (const item of order.items) {
-        await updateProductStock(
-          item.product,
-          item.barcode,
-          -item.quantity,
-          true,
-        );
+      // If new status decreases stock and old status did not
+      if (shouldDecreaseNew && !shouldDecreaseOld) {
+        for (const item of order.items) {
+          await updateProductStock(
+            item.product,
+            item.barcode,
+            -item.quantity,
+            true,
+          );
+        }
       }
-    }
 
-    // ✅ إذا كانت الحالة القديمة ناقصة المخزون والحالة الجديدة رجعت إلى غير مؤكدة / ارجاع
-    if (!shouldDecreaseNew && shouldDecreaseOld) {
-      for (const item of order.items) {
-        await updateProductStock(
-          item.product,
-          item.barcode,
-          item.quantity,
-          true,
-        );
+      // If old status decreased stock and new status restores it (unconfirmed / returned)
+      if (!shouldDecreaseNew && shouldDecreaseOld) {
+        for (const item of order.items) {
+          await updateProductStock(
+            item.product,
+            item.barcode,
+            item.quantity,
+            true,
+          );
+        }
       }
     }
 
@@ -318,23 +326,12 @@ exports.updateOrder = async (req, res) => {
         .json({ success: false, message: "البيانات المالية غير صالحة" });
     }
 
-    // Stock rollback (add back old quantities if stock was decreased)
+    // Stock change conditions
     const oldShouldDecrease =
       order.status !== "غير مؤكدة" && order.status !== "ارجاع";
     const newShouldDecrease = status !== "غير مؤكدة" && status !== "ارجاع";
 
-    if (oldShouldDecrease) {
-      // Add back old stock (rollback)
-      for (const item of order.items) {
-        await Product.updateOne(
-          { _id: item.product, "colors.sizes.barcode": item.barcode },
-          { $inc: { "colors.$[].sizes.$[s].quantity": item.quantity } },
-          { arrayFilters: [{ "s.barcode": item.barcode }] },
-        );
-      }
-    }
-
-    // Validate new items stock
+    // Validate new items stock BEFORE modifying any database stock
     for (const item of items) {
       const product = await Product.findById(item.product);
       if (!product)
@@ -378,7 +375,14 @@ exports.updateOrder = async (req, res) => {
       ]);
 
       const reservedQty = reserved[0]?.reservedQty || 0;
-      const available = foundSize.quantity - reservedQty;
+      // If the order previously held stock for this barcode, that quantity is available to be re-assigned
+      const oldItemQty = oldShouldDecrease
+        ? (order.items || [])
+            .filter((i) => i.barcode === item.barcode)
+            .reduce((sum, i) => sum + (i.quantity || 0), 0)
+        : 0;
+
+      const available = foundSize.quantity + oldItemQty - reservedQty;
 
       if (item.quantity > available) {
         return res.status(400).json({
@@ -388,14 +392,20 @@ exports.updateOrder = async (req, res) => {
       }
     }
 
-    const calculatedOriginalTotal = items.reduce(
-      (sum, it) => sum + (it.originalPrice || 0) * (it.quantity || 1),
-      0,
-    );
-    const calculatedProfit = total - calculatedOriginalTotal;
+    // Now that validation passed, perform stock adjustments
+    if (oldShouldDecrease) {
+      // Add back old stock (rollback)
+      for (const item of order.items) {
+        await Product.updateOne(
+          { _id: item.product, "colors.sizes.barcode": item.barcode },
+          { $inc: { "colors.$[].sizes.$[s].quantity": item.quantity } },
+          { arrayFilters: [{ "s.barcode": item.barcode }] },
+        );
+      }
+    }
 
-    // Apply new stock decrease if needed
     if (newShouldDecrease) {
+      // Deduct new stock
       for (const item of items) {
         await Product.updateOne(
           { _id: item.product, "colors.sizes.barcode": item.barcode },

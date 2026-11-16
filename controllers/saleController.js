@@ -942,17 +942,21 @@ exports.updateSale = async (req, res) => {
 
     // Track old quantities
     for (const item of oldItems) {
-      variantChanges.set(item.barcode, {
-        productId: item.product,
-        oldQty: item.quantity,
-        newQty: 0,
-      });
+      if (variantChanges.has(item.barcode)) {
+        variantChanges.get(item.barcode).oldQty += item.quantity;
+      } else {
+        variantChanges.set(item.barcode, {
+          productId: item.product,
+          oldQty: item.quantity,
+          newQty: 0,
+        });
+      }
     }
 
     // Track new quantities
     for (const item of newItems) {
       if (variantChanges.has(item.barcode)) {
-        variantChanges.get(item.barcode).newQty = item.quantity;
+        variantChanges.get(item.barcode).newQty += item.quantity;
       } else {
         variantChanges.set(item.barcode, {
           productId: item.product,

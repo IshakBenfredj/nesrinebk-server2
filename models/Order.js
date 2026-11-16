@@ -98,6 +98,7 @@ const OrderSchema = new mongoose.Schema(
       enum: [
         "صفحة فيسبوك",
         "إنستغرام",
+        "تيكتوك",
         "واتساب",
         "هاتف",
         "أخرى",
